@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
 using CUE4Parse.UE4.Assets;
+using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Objects.UObject;
 using FModel.Settings;
 
@@ -44,13 +46,33 @@ public static class CUE4ParseExtensions
         public string TabTitleExtra => IsPaginated ? $"Export{(PageSize > 1 ? "s" : "")} {InclusiveStart}{(PageSize > 1 ? $"-{ExclusiveEnd - 1}" : "")} of {Package.ExportMapLength - 1}" : null;
 
         /// <summary>
-        /// display all exports unless paginated
+        /// display all exports unless paginated.
+        /// When saving, each export is loaded individually so that a single failing export
+        /// (e.g. a complex material with shader map data) does not prevent the rest from being serialized.
         /// </summary>
         /// <param name="save">if we save the data we will display all exports even if <see cref="IsPaginated"/> is true</param>
         /// <returns></returns>
-        public object GetDisplayData(bool save = false) => !save && IsPaginated
-            ? Package.GetExports(InclusiveStart, PageSize)
-            : Package.GetExports();
+        public object GetDisplayData(bool save = false)
+        {
+            if (!save && IsPaginated)
+                return Package.GetExports(InclusiveStart, PageSize);
+
+            var exports = new List<UObject>();
+            for (var i = 0; i < Package.ExportMapLength; i++)
+            {
+                try
+                {
+                    var obj = Package.GetExport(i);
+                    if (obj != null)
+                        exports.Add(obj);
+                }
+                catch (Exception)
+                {
+                    // skip exports that fail to deserialize (e.g. complex materials with shader maps)
+                }
+            }
+            return exports;
+        }
     }
 
     public static LoadPackageResult GetLoadPackageResult(this IFileProvider provider, GameFile file, string objectName = null)

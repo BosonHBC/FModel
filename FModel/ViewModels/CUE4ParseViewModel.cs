@@ -636,9 +636,13 @@ public class CUE4ParseViewModel : ViewModel
             {
                 action(entry.Asset);
             }
-            catch
+            catch (OperationCanceledException)
             {
-                // ignore
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to extract '{FilePath}'", entry.Asset.Path);
             }
         });
 
