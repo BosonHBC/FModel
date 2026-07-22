@@ -23,6 +23,20 @@ def type_color(t):
             return v
     return '#999999'
 
+TYPE_ABBREV = {
+    'StaticMesh': 'SM', 'SkeletalMesh': 'SKM', 'Texture2D': 'T',
+    'Texture': 'T', 'MaterialInstanceConstant': 'MI', 'MaterialInstance': 'MI',
+    'MaterialFunction': 'MF', 'Material': 'M',
+}
+
+def type_abbrev(t):
+    if not t:
+        return '?'
+    for k, v in TYPE_ABBREV.items():
+        if k in t:
+            return v
+    return '?'
+
 def norm_path(p):
     """Strip subobject suffix from UE path (/Game/.../Asset.0 -> /Game/.../Asset)."""
     if not p:
@@ -190,6 +204,7 @@ class GraphCanvas(tk.Canvas):
         self.center = None
         self.depth = 1
         self.ox, self.oy = 0, 0
+        self.zoom = 1.0
         self.drag = None
         self.hovered = None
         self.bind('<Button-1>', self._click)
@@ -199,11 +214,13 @@ class GraphCanvas(tk.Canvas):
         self.bind('<Motion>', self._motion)
         self.bind('<Leave>', lambda e: self._set_hovered(None))
         self.bind('<Button-3>', self._right_click)
+        self.bind('<MouseWheel>', self._wheel)
 
     def show(self, pp, depth=1):
         self.center = pp
         self.depth = depth
         self.ox = self.oy = 0
+        self.zoom = 1.0
         self._build()
 
     def _build(self):
@@ -234,10 +251,14 @@ class GraphCanvas(tk.Canvas):
         inn = db.get_incoming(self.center)
 
         # Layout outgoing on right, incoming on left
-        col_x_out = cx + 240
-        col_x_in = cx - 240
-        sp_out = max(45, min(70, h / max(len(out), 1) / 2)) if out else 60
-        sp_in = max(45, min(70, h / max(len(inn), 1) / 2)) if inn else 60
+        col_x_out = cx + 260
+        col_x_in = cx - 260
+        sp_out = max(80, min(110, h / max(len(out), 1) / 2)) if out else 60
+        sp_in = max(80, min(110, h / max(len(inn), 1) / 2)) if inn else 60
+
+        # When depth=2, we need extra vertical space for sub-nodes, so use larger spacing
+        if self.depth >= 2 and out:
+            sp_out = max(100, min(130, h / max(len(out), 1) / 2))
 
         for i, r in enumerate(out):
             y = cy + (i - len(out) / 2 + 0.5) * sp_out
@@ -253,55 +274,81 @@ class GraphCanvas(tk.Canvas):
                 self.nodes[p] = {'x': col_x_in, 'y': y, 'r': 22, 'info': r, 'center': False, 'dir': 'in'}
             self.edges.append((p, self.center, 'in'))
 
-        # Depth 2: show second-level outgoing
+        # Depth 2: show second-level outgoing (greedy non-overlapping layout)
         if self.depth >= 2 and ca:
+            sub_col_x = col_x_out + 200
+            sub_sp = 48
+            sub_r = 15
+            # Collect sub-node groups per parent
+            groups = []
             for r in out:
                 p = r['target_path']
                 if p in self.nodes and not self.nodes[p].get('center'):
                     ra = db.get_by_path(p)
                     if ra:
                         o2 = db.get_outgoing(ra['id'])
-                        for j, r2 in enumerate(o2[:10]):
+                        subs = []
+                        for r2 in o2[:6]:
                             p2 = r2['target_path']
                             if p2 not in self.nodes and p2 != self.center:
-                                base_y = self.nodes[p]['y']
-                                self.nodes[p2] = {
-                                    'x': col_x_out + 180, 'y': base_y + (j - len(o2[:10]) / 2 + 0.5) * 28,
-                                    'r': 16, 'info': r2, 'center': False, 'dir': 'out2'
-                                }
-                                self.edges.append((p, p2, 'out2'))
+                                subs.append(r2)
+                        if subs:
+                            groups.append((p, subs))
+            # Sort by parent y position and place greedily without overlap
+            groups.sort(key=lambda g: self.nodes[g[0]]['y'])
+            cur_bottom = -1e9
+            for parent_path, subs in groups:
+                parent_y = self.nodes[parent_path]['y']
+                span = len(subs) * sub_sp
+                desired_top = parent_y - span / 2
+                top = max(desired_top, cur_bottom + 5)
+                for j, r2 in enumerate(subs):
+                    p2 = r2['target_path']
+                    y = top + (j + 0.5) * sub_sp
+                    self.nodes[p2] = {
+                        'x': sub_col_x, 'y': y, 'r': sub_r,
+                        'info': r2, 'center': False, 'dir': 'out2'
+                    }
+                    self.edges.append((parent_path, p2, 'out2'))
+                cur_bottom = top + span
 
         self.draw()
 
     def draw(self):
         self.delete('all')
+        z = self.zoom
         # Draw edges
         for s, t, d in self.edges:
             if s in self.nodes and t in self.nodes:
                 sn, tn = self.nodes[s], self.nodes[t]
-                x1, y1 = sn['x'] + self.ox, sn['y'] + self.oy
-                x2, y2 = tn['x'] + self.ox, tn['y'] + self.oy
+                x1, y1 = sn['x'] * z + self.ox, sn['y'] * z + self.oy
+                x2, y2 = tn['x'] * z + self.ox, tn['y'] * z + self.oy
                 if d == 'in':
                     self.create_line(x2, y2, x1, y1, fill='#555555', dash=(3, 2), arrow='last', width=1)
                 elif d == 'out2':
                     self.create_line(x1, y1, x2, y2, fill='#444444', arrow='last', width=1)
                 else:
                     self.create_line(x1, y1, x2, y2, fill='#888888', arrow='last', width=1.5)
-        # Draw nodes
+        # Draw nodes as rounded squares with type abbreviation inside
         for p, n in self.nodes.items():
-            x, y, r = n['x'] + self.ox, n['y'] + self.oy, n['r']
+            x, y = n['x'] * z + self.ox, n['y'] * z + self.oy
+            r = n['r'] * z
             info = n['info']
             at = info.get('type') or info.get('target_type') or 'Unknown'
             c = type_color(at)
             ow = 3 if n.get('center') else (2 if self.hovered == p else 1)
             oc = '#FFFFFF' if n.get('center') else ('#FFAAAA' if self.hovered == p else '#333333')
-            self.create_oval(x - r, y - r, x + r, y + r, fill=c, outline=oc, width=ow)
+            self._create_rounded_rect(x - r, y - r, x + r, y + r, radius=r * 0.25, fill=c, outline=oc, width=ow)
+            abbrev = type_abbrev(at)
+            fs = int(r * 0.75)
+            self.create_text(x, y, text=abbrev, fill='#FFFFFF', font=('Segoe UI', max(fs, 6), 'bold'))
             nm = info.get('name') or os.path.basename(p)
             if len(nm) > 28:
                 nm = nm[:25] + '...'
-            self.create_text(x, y + r + 12, text=nm, fill='#DDDDDD', font=('Segoe UI', 8))
-            tl = at if len(at) < 16 else at[:13] + '...'
-            self.create_text(x, y + r + 24, text=tl, fill='#777777', font=('Segoe UI', 7))
+            ty1 = y + r + 12
+            tw = max(len(nm) * 4.5, 40)
+            self.create_rectangle(x - tw/2, ty1 - 8, x + tw/2, ty1 + 8, fill='#1E1E1E', outline='')
+            self.create_text(x, ty1, text=nm, fill='#DDDDDD', font=('Segoe UI', 8))
         # Direction labels
         if self.nodes:
             w = max(self.winfo_width(), 700)
@@ -313,17 +360,35 @@ class GraphCanvas(tk.Canvas):
 
     def _draw_legend(self):
         x, y = 12, 50
-        items = [('StaticMesh', '#4A90D9'), ('Texture2D', '#7EC850'), ('Material', '#E85A35'),
-                 ('MatInstance', '#E8A735'), ('Missing', '#999999')]
-        for label, color in items:
-            self.create_oval(x, y, x + 12, y + 12, fill=color, outline='#333333')
-            self.create_text(x + 16, y + 6, text=label, fill='#999999', font=('Segoe UI', 7), anchor='w')
-            y += 16
+        items = [('SM', 'StaticMesh', '#4A90D9'), ('T', 'Texture2D', '#7EC850'),
+                 ('M', 'Material', '#E85A35'), ('MI', 'MatInstance', '#E8A735'),
+                 ('?', 'Missing', '#999999')]
+        for abbrev, label, color in items:
+            self._create_rounded_rect(x, y, x + 14, y + 14, radius=3, fill=color, outline='#333333')
+            self.create_text(x + 7, y + 7, text=abbrev, fill='#FFFFFF', font=('Segoe UI', 6, 'bold'))
+            self.create_text(x + 18, y + 7, text=label, fill='#999999', font=('Segoe UI', 7), anchor='w')
+            y += 18
+
+    def _create_rounded_rect(self, x1, y1, x2, y2, radius=8, **kwargs):
+        """Draw a rounded rectangle on the canvas."""
+        radius = min(radius, (x2 - x1) / 2, (y2 - y1) / 2)
+        points = []
+        # Top-left corner
+        points.extend([x1 + radius, y1, x1, y1, x1, y1 + radius])
+        # Left edge to bottom-left corner
+        points.extend([x1, y2 - radius, x1, y2, x1 + radius, y2])
+        # Bottom edge to bottom-right corner
+        points.extend([x2 - radius, y2, x2, y2, x2, y2 - radius])
+        # Right edge to top-right corner
+        points.extend([x2, y1 + radius, x2, y1, x2 - radius, y1])
+        return self.create_polygon(points, smooth=True, **kwargs)
 
     def _hit(self, ex, ey):
         for p, n in self.nodes.items():
-            x, y = n['x'] + self.ox, n['y'] + self.oy
-            if (ex - x) ** 2 + (ey - y) ** 2 <= n['r'] ** 2:
+            x = n['x'] * self.zoom + self.ox
+            y = n['y'] * self.zoom + self.oy
+            r = n['r'] * self.zoom
+            if abs(ex - x) <= r and abs(ey - y) <= r:
                 return p
         return None
 
@@ -343,6 +408,19 @@ class GraphCanvas(tk.Canvas):
 
     def _release(self, e):
         self.drag = None
+
+    def _wheel(self, e):
+        factor = 1.15 if e.delta > 0 else 1 / 1.15
+        new_zoom = self.zoom * factor
+        if new_zoom < 0.3 or new_zoom > 5.0:
+            return
+        mx, my = e.x, e.y
+        wx = (mx - self.ox) / self.zoom
+        wy = (my - self.oy) / self.zoom
+        self.zoom = new_zoom
+        self.ox = mx - wx * self.zoom
+        self.oy = my - wy * self.zoom
+        self.draw()
 
     def _dblclick(self, e):
         p = self._hit(e.x, e.y)
@@ -383,7 +461,9 @@ class GraphCanvas(tk.Canvas):
         self.clipboard_append(p)
 
     def _menu_explorer(self, full_path):
-        os.system(f'explorer /select,"{full_path}"')
+        import subprocess
+        normalized = os.path.normpath(full_path)
+        subprocess.Popen(['explorer', '/select,', normalized])
 
 
 # ======================== Main Application ========================
@@ -446,6 +526,7 @@ class App:
             "  - Double-click node: center on it\n"
             "  - Single-click: show details\n"
             "  - Drag empty space: pan\n"
+            "  - Mouse wheel: zoom in/out (toward cursor)\n"
             "  - Right-click: context menu (copy path, open in explorer)"
         )
         ttk.Label(f, text=info_text, justify='left', font=('Segoe UI', 9)).grid(
@@ -477,11 +558,7 @@ class App:
         tree_scroll.pack(side='right', fill='y')
         self.tree.bind('<Double-1>', self._tree_dblclick)
 
-        # Center: graph canvas
-        self.canvas = GraphCanvas(f, self)
-        self.canvas.pack(side='left', fill='both', expand=True, padx=5, pady=5)
-
-        # Right panel: details
+        # Right panel: details (pack before canvas so it gets proper space)
         rp = ttk.Frame(f, width=320)
         rp.pack(side='right', fill='y', padx=(0, 5), pady=5)
         rp.pack_propagate(False)
@@ -490,17 +567,25 @@ class App:
                                    font=('Consolas', 9), relief='flat')
         self.detail_text.pack(fill='both', expand=True, pady=(0, 5))
 
-        # Bottom controls
-        bf = ttk.Frame(f)
-        bf.pack(side='bottom', fill='x', padx=5, pady=5)
-        ttk.Label(bf, text="Depth:").pack(side='left', padx=(5, 2))
+        # Center: controls bar + graph canvas
+        center = ttk.Frame(f)
+        center.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+
+        # Top controls bar (compact, replaces old bottom bar)
+        cf = ttk.Frame(center)
+        cf.pack(side='top', fill='x', pady=(0, 5))
+        ttk.Label(cf, text="Depth:").pack(side='left', padx=(5, 2))
         self.depth_var = tk.IntVar(value=1)
-        ttk.Radiobutton(bf, text="1 (direct)", variable=self.depth_var, value=1,
-                        command=self._refresh_graph).pack(side='left')
-        ttk.Radiobutton(bf, text="2 (extended)", variable=self.depth_var, value=2,
-                        command=self._refresh_graph).pack(side='left')
-        ttk.Button(bf, text="Refresh Graph", command=self._refresh_graph).pack(side='left', padx=10)
-        ttk.Button(bf, text="Clear Graph", command=lambda: self.canvas.show(None)).pack(side='left', padx=5)
+        ttk.Radiobutton(cf, text="1 (direct)", variable=self.depth_var, value=1,
+                        command=self._refresh_graph).pack(side='left', padx=2)
+        ttk.Radiobutton(cf, text="2 (extended)", variable=self.depth_var, value=2,
+                        command=self._refresh_graph).pack(side='left', padx=2)
+        ttk.Button(cf, text="Refresh Graph", command=self._refresh_graph).pack(side='right', padx=5)
+        ttk.Button(cf, text="Clear Graph", command=lambda: self.canvas.show(None)).pack(side='right', padx=5)
+
+        # Graph canvas
+        self.canvas = GraphCanvas(center, self)
+        self.canvas.pack(side='top', fill='both', expand=True)
 
     def _browse(self):
         d = filedialog.askdirectory(initialdir=self.dir_var.get())

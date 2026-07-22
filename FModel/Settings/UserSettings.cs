@@ -570,6 +570,20 @@ namespace FModel.Settings
             set => SetProperty(ref _saveHdrTexturesAsHdr, value);
         }
 
+        private bool _skipExistingExports;
+        public bool SkipExistingExports
+        {
+            get => _skipExistingExports;
+            set => SetProperty(ref _skipExistingExports, value);
+        }
+
+        private int _bulkExportMaxDegreeOfParallelism = 0;
+        public int BulkExportMaxDegreeOfParallelism
+        {
+            get => _bulkExportMaxDegreeOfParallelism;
+            set => SetProperty(ref _bulkExportMaxDegreeOfParallelism, value);
+        }
+
         private bool _featurePreviewNewAssetExplorer = true;
         public bool FeaturePreviewNewAssetExplorer
         {

@@ -46,6 +46,8 @@
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto" />
@@ -70,10 +72,12 @@
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                        </Grid.RowDefinitions>
-                        <Grid.ColumnDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="10" />
                             <ColumnDefinition Width="{Binding ActualWidth, ElementName=ImJackedBro}" />
@@ -276,6 +280,35 @@
                              TextChanged="CriwareKeyBox_TextChanged"
                              Loaded="CriwareKeyBox_Loaded"/>
 
+                    <TextBlock Grid.Row="22"
+                               Grid.Column="0"
+                               Text="Skip Existing Exports"
+                               VerticalAlignment="Center"
+                               Margin="0 0 0 5"
+                               ToolTip="Skip exporting files that already exist in the output directory" />
+                    <CheckBox Grid.Row="22"
+                              Grid.Column="2"
+                              Content="{Binding IsChecked, RelativeSource={RelativeSource Self}, Converter={x:Static converters:BoolToToggleConverter.Instance}}"
+                              IsChecked="{Binding SkipExistingExports, Source={x:Static local:Settings.UserSettings.Default}, Mode=TwoWay}"
+                              Margin="0 5 0 10"
+                              Style="{DynamicResource {x:Static adonisUi:Styles.ToggleSwitch}}" />
+
+                    <TextBlock Grid.Row="23"
+                               Grid.Column="0"
+                               Text="Bulk Export Parallelism"
+                               VerticalAlignment="Center"
+                               Margin="0 0 0 10"
+                               ToolTip="Maximum degree of parallelism for bulk export (0 = auto, 1 = single thread)" />
+                    <TextBox Grid.Row="23"
+                             Grid.Column="2"
+                             Margin="0 5 0 10"
+                             VerticalAlignment="Center"
+                             VerticalContentAlignment="Center"
+                             MaxLength="3"
+                             ToolTip="Maximum degree of parallelism for bulk export (0 = auto, 1 = single thread)"
+                             TextAlignment="Right"
+                             Text="{Binding BulkExportMaxDegreeOfParallelism, Source={x:Static local:Settings.UserSettings.Default}, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+
                 </Grid>
             </DataTemplate>
             <DataTemplate x:Key="CreatorTemplate">
@@ -317,10 +350,12 @@
                     </Image>
                     <Grid Grid.Column="3" Grid.ColumnSpan="5" Margin="10 0 0 0" VerticalAlignment="Top">
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                        </Grid.RowDefinitions>
-                        <Grid.ColumnDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="10" />
                             <ColumnDefinition Width="*" />
@@ -346,6 +381,8 @@
             <DataTemplate x:Key="ModelsTemplate">
                 <Grid adonisExtensions:LayerExtension.Layer="2">
                     <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
@@ -564,6 +601,8 @@
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto" />
@@ -615,6 +654,8 @@
             <DataTemplate x:Key="UnluacTemplate">
                 <Grid adonisExtensions:LayerExtension.Layer="2">
                     <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
