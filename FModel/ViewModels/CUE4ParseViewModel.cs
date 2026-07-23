@@ -64,6 +64,7 @@ using CUE4Parse.UE4.Versions;
 using CUE4Parse.UE4.Wwise;
 using CUE4Parse.Utils;
 using CUE4Parse_Conversion;
+using CUE4Parse_Conversion.Materials;
 using CUE4Parse_Conversion.Meshes;
 using CUE4Parse_Conversion.Textures;
 using CUE4Parse_Conversion.Sounds;
@@ -166,6 +167,30 @@ public class CUE4ParseViewModel : ViewModel
 
     public int ExportedCount;
     public int FailedExportCount;
+
+    /// <summary>
+    /// Mesh-only export counter (excludes referenced material JSON / textures), used to periodically
+    /// report progress during a "Save Models" bulk run. Reset at the start of each bulk export.
+    /// </summary>
+    public int ExportedMeshCount;
+    /// <summary>Material JSON files actually written during the current Save Models run.</summary>
+    public int ExportedMaterialCount;
+    /// <summary>How many meshes to export between progress log messages.</summary>
+    private const int MeshProgressLogInterval = 25;
+
+    /// <summary>
+    /// Thread-safe set of texture keys that have already been (or are being) exported during a bulk parallel run.
+    /// Prevents duplicate decode/write and race conditions when a texture is referenced by multiple assets.
+    /// The first thread to claim a key wins; all others skip. Cleared at the start of each bulk export.
+    /// </summary>
+    public readonly ConcurrentDictionary<string, byte> ExportedTextureKeys = new();
+
+    /// <summary>
+    /// Thread-safe set of mesh export keys already claimed during a bulk parallel run.
+    /// Same "first thread wins" in-memory de-dup as textures/materials, so a mesh referenced/visited
+    /// more than once in a single bulk run is only written once. Cleared at the start of each bulk export.
+    /// </summary>
+    public readonly ConcurrentDictionary<string, byte> ExportedMeshKeys = new();
 
     public CUE4ParseViewModel()
     {
@@ -629,12 +654,21 @@ public class CUE4ParseViewModel : ViewModel
             ? new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = maxDop }
             : new ParallelOptions { CancellationToken = cancellationToken };
 
-        Parallel.ForEach(folder.AssetsList.Assets, options, entry =>
+        // Flatten the whole folder tree into a single work list first, then run ONE Parallel.ForEach.
+        // Previously we called Parallel.ForEach per-folder and only recursed into sub-folders after the
+        // current folder fully finished — that created a barrier at every folder boundary, so a single
+        // slow asset would leave other threads idle instead of letting them pick up sub-folder assets.
+        // With a flat list, any thread that finishes an asset immediately steals the next one from the
+        // global queue regardless of which sub-folder it belongs to (true work-stealing across the tree).
+        var allAssets = new List<GameFile>();
+        CollectAssetsRecursive(folder, allAssets);
+
+        Parallel.ForEach(allAssets, options, asset =>
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                action(entry.Asset);
+                action(asset);
             }
             catch (OperationCanceledException)
             {
@@ -642,11 +676,282 @@ public class CUE4ParseViewModel : ViewModel
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "Failed to extract '{FilePath}'", entry.Asset.Path);
+                Log.Error(ex, "Failed to extract '{FilePath}'", asset.Path);
             }
         });
+    }
 
-        foreach (var f in folder.Folders) BulkFolder(cancellationToken, f, action);
+    /// <summary>
+    /// Recursively flattens a folder tree into a single list of assets (depth-first),
+    /// so bulk export can schedule them through one global parallel work queue.
+    /// </summary>
+    private static void CollectAssetsRecursive(TreeItem folder, List<GameFile> output)
+    {
+        foreach (var entry in folder.AssetsList.Assets)
+            output.Add(entry.Asset);
+
+        foreach (var f in folder.Folders)
+            CollectAssetsRecursive(f, output);
+    }
+
+    /// <summary>
+    /// Statistics for a bulk export pre-scan pass.
+    /// Total = number of matching resources found in the folder tree.
+    /// AlreadyExported = resources whose output file already exists on disk (would be skipped).
+    /// ToExport = resources that will actually be exported (Total - AlreadyExported).
+    /// </summary>
+    public struct BulkExportStats
+    {
+        public int Total;
+        public int AlreadyExported;
+        public int ToExport => Total - AlreadyExported;
+
+        // For "Save Models": referenced materials and textures discovered during the scan.
+        public int MaterialTotal;
+        public int MaterialAlreadyExported;
+        public int MaterialToExport => MaterialTotal - MaterialAlreadyExported;
+        public int TextureTotal;
+        public int TextureAlreadyExported;
+        public int TextureToExport => TextureTotal - TextureAlreadyExported;
+    }
+
+    /// <summary>
+    /// Recursively scans a folder tree BEFORE exporting and counts how many resources of the requested
+    /// bulk type exist, how many are already exported on disk, and how many still need exporting.
+    /// This does not perform any decoding/writing — it only loads packages and inspects export types/paths.
+    /// </summary>
+    public BulkExportStats CollectBulkStats(CancellationToken cancellationToken, TreeItem folder, EBulkType bulk)
+    {
+        var stats = new BulkExportStats();
+        var seenTextureKeys = new HashSet<string>();
+        var seenMaterialKeys = new HashSet<string>();
+        var seenMeshMaterialTexKeys = new HashSet<string>();
+        CollectBulkStatsRecursive(cancellationToken, folder, bulk, ref stats, seenTextureKeys, seenMaterialKeys, seenMeshMaterialTexKeys);
+        return stats;
+    }
+
+    private void CollectBulkStatsRecursive(CancellationToken cancellationToken, TreeItem folder, EBulkType bulk, ref BulkExportStats stats, HashSet<string> seenTextureKeys, HashSet<string> seenMaterialKeys, HashSet<string> seenMeshMaterialTexKeys)
+    {
+        foreach (var entryVm in folder.AssetsList.Assets)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                CountEntry(entryVm.Asset, bulk, ref stats, seenTextureKeys, seenMaterialKeys, seenMeshMaterialTexKeys);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Collect stats failed for '{FilePath}'", entryVm.Asset.Path);
+            }
+        }
+
+        foreach (var f in folder.Folders)
+            CollectBulkStatsRecursive(cancellationToken, f, bulk, ref stats, seenTextureKeys, seenMaterialKeys, seenMeshMaterialTexKeys);
+    }
+
+    private void CountEntry(GameFile entry, EBulkType bulk, ref BulkExportStats stats, HashSet<string> seenTextureKeys, HashSet<string> seenMaterialKeys, HashSet<string> seenMeshMaterialTexKeys)
+    {
+        var saveProperties = HasFlag(bulk, EBulkType.Properties);
+        var saveTextures = HasFlag(bulk, EBulkType.Textures);
+        var saveMeshes = HasFlag(bulk, EBulkType.Meshes);
+        var saveAnimations = HasFlag(bulk, EBulkType.Animations);
+
+        if (entry.Extension is not ("uasset" or "umap"))
+            return;
+
+        // Properties: one JSON per package
+        if (saveProperties)
+        {
+            stats.Total++;
+            var jsonPath = Path.Combine(UserSettings.Default.PropertiesDirectory,
+                UserSettings.Default.KeepDirectoryStructure ? entry.Directory : entry.Directory.SubstringAfterLast('/'),
+                Path.ChangeExtension(entry.Name, ".json")).Replace('\\', '/');
+            if (UserSettings.Default.SkipExistingExports && File.Exists(jsonPath))
+                stats.AlreadyExported++;
+            return;
+        }
+
+        var result = Provider.GetLoadPackageResult(entry);
+        for (var i = result.InclusiveStart; i < result.ExclusiveEnd; i++)
+        {
+            var pointer = new FPackageIndex(result.Package, i + 1).ResolvedObject;
+            if (pointer?.Object is null) continue;
+
+            UObject dummy;
+            try { dummy = ((AbstractUePackage) result.Package).ConstructObject(pointer.Class, result.Package); }
+            catch { continue; }
+
+            switch (dummy)
+            {
+                case UTexture when saveTextures && pointer.Object.Value is UTexture texture:
+                {
+                    // mirror the de-dup key used by SaveTextureBulk
+                    var dedupKey = (texture.Owner?.Name ?? "") + "/" + texture.Name;
+                    if (!seenTextureKeys.Add(dedupKey))
+                        continue; // duplicate reference, counted once already
+
+                    stats.Total++;
+                    var dir = UserSettings.Default.KeepDirectoryStructure ? entry.Directory : "";
+                    var pngPath = Path.Combine(UserSettings.Default.TextureDirectory, dir, $"{texture.Name}.png").Replace('\\', '/');
+                    // texture output extension may vary (hdr/tga); png is the common case, also check any existing file with same stem
+                    if (UserSettings.Default.SkipExistingExports && TextureAlreadyExported(UserSettings.Default.TextureDirectory, dir, texture.Name))
+                        stats.AlreadyExported++;
+                    break;
+                }
+                case UStaticMesh when saveMeshes:
+                case USkeletalMesh when saveMeshes:
+                case USkeleton when UserSettings.Default.SaveSkeletonAsMesh && saveMeshes:
+                case UAnimSequenceBase when saveAnimations:
+                {
+                    stats.Total++;
+                    if (UserSettings.Default.SkipExistingExports)
+                    {
+                        try
+                        {
+                            if (pointer.Object.Value is { } meshObj && MeshAlreadyExported(meshObj))
+                                stats.AlreadyExported++;
+                        }
+                        catch { /* count as to-export if we can't verify */ }
+                    }
+
+                    // For meshes, also account for the referenced materials (JSON) and their textures,
+                    // mirroring what SaveReferencedMaterialsJson / MaterialExporter2 will actually export.
+                    if (saveMeshes)
+                    {
+                        try { CountMeshMaterialsAndTextures(pointer.Object.Value, ref stats, seenMaterialKeys, seenMeshMaterialTexKeys); }
+                        catch (Exception ex) { Log.Warning(ex, "Collect material/texture stats failed for mesh '{Name}'", entry.Name); }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    private static bool TextureAlreadyExported(string baseDir, string dir, string name)
+    {
+        var folder = Path.Combine(baseDir, dir).Replace('\\', '/');
+        if (!Directory.Exists(folder)) return false;
+        // any file named "<name>.*" counts as already exported
+        foreach (var ext in new[] { ".png", ".tga", ".hdr", ".jpg", ".jpeg", ".dds" })
+        {
+            if (File.Exists(Path.Combine(folder, name + ext)))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool MeshAlreadyExported(UObject export)
+    {
+        var exportSavePath = ExporterBase.GetExportSavePath(
+            (export.Owner?.Provider?.FixPath(export.Owner?.Name ?? export.GetPathName()) ?? export.GetPathName()).SubstringBeforeLast('.'),
+            export.Name);
+        var expectedPath = Path.Combine(UserSettings.Default.ModelDirectory, exportSavePath).Replace('\\', '/');
+        var exts = UserSettings.Default.MeshExportFormat switch
+        {
+            EMeshFormat.UEFormat => new[] { ".uemodel" },
+            EMeshFormat.ActorX => new[] { ".pskx", ".psk" },
+            EMeshFormat.Gltf2 => new[] { ".glb" },
+            EMeshFormat.OBJ => new[] { ".obj" },
+            _ => new[] { ".pskx" }
+        };
+        foreach (var ext in exts)
+            if (File.Exists(expectedPath + ext)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Scan-only accounting for a mesh's referenced materials and their textures.
+    /// Mirrors SaveReferencedMaterialsJson (material JSON -> Properties dir) and
+    /// MaterialExporter2 (textures -> Model dir) so the pre-scan numbers match what is actually exported.
+    /// De-dup sets are shared across the whole scan so shared materials/textures are counted once.
+    /// </summary>
+    private void CountMeshMaterialsAndTextures(UObject meshExport, ref BulkExportStats stats, HashSet<string> seenMaterialKeys, HashSet<string> seenTextureKeys)
+    {
+        ResolvedObject?[] materials = meshExport switch
+        {
+            UStaticMesh sm => sm.Materials,
+            USkeletalMesh sk => sk.Materials,
+            _ => []
+        };
+        if (materials is null || materials.Length == 0) return;
+
+        foreach (var resolved in materials)
+        {
+            UMaterialInterface? material;
+            try { material = resolved?.Load() as UMaterialInterface; }
+            catch { continue; }
+
+            // Walk the material chain (MI -> parent MI/MIC -> base Material), same as SaveMaterialChainJson.
+            var current = material;
+            var guard = 0;
+            while (current is not null && guard++ < 16)
+            {
+                CountSingleMaterial(current, ref stats, seenMaterialKeys, seenTextureKeys);
+                current = (current as UMaterialInstance)?.Parent as UMaterialInterface;
+            }
+        }
+    }
+
+    private void CountSingleMaterial(UMaterialInterface material, ref BulkExportStats stats, HashSet<string> seenMaterialKeys, HashSet<string> seenTextureKeys)
+    {
+        var owner = material.Owner;
+        if (owner is null) return;
+        var packageName = owner.Name;
+
+        if (seenMaterialKeys.Add(packageName))
+        {
+            stats.MaterialTotal++;
+            // Material JSON goes to the Properties dir. Resolve the package entry EXACTLY like
+            // SaveMaterialChainJson does (via FixPath, so the "/Game/..." logical path maps to the real
+            // on-disk key), otherwise the already-exported check never matches the real output path.
+            var fixedPath = (material.Owner?.Provider?.FixPath(packageName) ?? packageName).SubstringBeforeLast('.');
+            var lookupBase = fixedPath;
+            GameFile? entry = null;
+            foreach (var ext in new[] { ".uasset", ".umap" })
+            {
+                var key = (lookupBase.StartsWith('/') ? lookupBase[1..] : lookupBase) + ext;
+                if (Provider.Files.TryGetValue(key, out entry) || Provider.Files.TryGetValue(lookupBase + ext, out entry))
+                    break;
+                entry = null;
+            }
+            if (entry != null && UserSettings.Default.SkipExistingExports)
+            {
+                var jsonPath = Path.Combine(UserSettings.Default.PropertiesDirectory,
+                    UserSettings.Default.KeepDirectoryStructure ? entry.Directory : entry.Directory.SubstringAfterLast('/'),
+                    Path.ChangeExtension(entry.Name, ".json")).Replace('\\', '/');
+                if (File.Exists(jsonPath))
+                    stats.MaterialAlreadyExported++;
+            }
+        }
+
+        // Collect the material's textures (same source MaterialExporter2 uses to write PNGs to the Model dir).
+        try
+        {
+            var prms = new CMaterialParams2();
+            material.GetParams(prms, UserSettings.Default.ExportOptions.MaterialFormat);
+            foreach (var tex in prms.Textures.Values)
+            {
+                if (tex is not UTexture2D t) continue;
+                var dedupKey = (t.Owner?.Name ?? "") + "/" + t.Name;
+                if (!seenTextureKeys.Add(dedupKey)) continue;
+
+                stats.TextureTotal++;
+                // MaterialExporter2 writes textures under ModelDirectory using FixPath(owner) stem.
+                var stem = (t.Owner?.Provider?.FixPath(t.Owner.Name) ?? t.Name).SubstringBeforeLast('.');
+                var relStem = stem.StartsWith('/') ? stem[1..] : stem;
+                var texDir = Path.Combine(UserSettings.Default.ModelDirectory, relStem.SubstringBeforeLast('/')).Replace('\\', '/');
+                if (UserSettings.Default.SkipExistingExports && TextureAlreadyExported(texDir, "", relStem.SubstringAfterLast('/')))
+                    stats.TextureAlreadyExported++;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Collect textures failed for material '{Name}'", material.Name);
+        }
     }
 
     public void ExportFolder(CancellationToken cancellationToken, TreeItem folder)
@@ -661,7 +966,19 @@ public class CUE4ParseViewModel : ViewModel
     }
 
     public void ExtractFolder(CancellationToken cancellationToken, TreeItem folder, EBulkType bulk)
-        => BulkFolder(cancellationToken, folder, asset => ExtractBulk(cancellationToken, asset, bulk));
+    {
+        // Reset per-bulk-run de-duplication state. These dictionaries are process-lifetime instances,
+        // so without clearing them here, a material/texture exported in a PREVIOUS bulk run would keep
+        // its key and cause SaveMaterialChainJson / texture export to skip it on later runs — producing
+        // the "collected N to export but 0 exported" contradiction. Clearing per run makes the de-dup
+        // scope = "this bulk export", while on-disk File.Exists checks still prevent real re-writes.
+        ExportedMaterialJsonKeys.Clear();
+        ExportedTextureKeys.Clear();
+        ExportedMeshKeys.Clear();
+        CUE4Parse_Conversion.Materials.MaterialExporter2.ExportedTextureKeys.Clear();
+
+        BulkFolder(cancellationToken, folder, asset => ExtractBulk(cancellationToken, asset, bulk));
+    }
 
     public void ExtractFolder(CancellationToken cancellationToken, TreeItem folder)
         => BulkFolder(cancellationToken, folder, asset => Extract(cancellationToken, asset, TabControl.HasNoTabs));
@@ -1075,6 +1392,77 @@ public class CUE4ParseViewModel : ViewModel
     }
 
     /// <summary>
+    /// Export all permutation shaders (DXIL/DXBC) of a material and optionally decompile them to HLSL.
+    /// Triggered by the "Export Material Shaders (HLSL)" context menu entry.
+    /// </summary>
+    public void ExportMaterialShaders(CancellationToken cancellationToken, GameFile entry)
+    {
+        if (!UserSettings.Default.ReadShaderMaps)
+        {
+            FLogger.Append(ELog.Warning, () => FLogger.Text(
+                "Export Material Shaders requires 'Read Shader Maps' to be enabled (Settings > Advanced). Enable it, reload the asset, then try again.",
+                Constants.WHITE, true));
+            return;
+        }
+
+        UMaterialInterface material = null;
+        var result = Provider.GetLoadPackageResult(entry);
+        for (var i = result.InclusiveStart; i < result.ExclusiveEnd; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var pointer = new FPackageIndex(result.Package, i + 1).ResolvedObject;
+            if (pointer?.Object?.Value is UMaterialInterface mat)
+            {
+                material = mat;
+                break;
+            }
+        }
+
+        if (material is null)
+        {
+            FLogger.Append(ELog.Warning, () => FLogger.Text(
+                $"No material found in '{entry.Name}'.", Constants.WHITE, true));
+            return;
+        }
+
+        var jsonDir = Path.Combine(UserSettings.Default.PropertiesDirectory,
+            UserSettings.Default.KeepDirectoryStructure ? entry.Directory : entry.Directory.SubstringAfterLast('/'))
+            .Replace('\\', '/');
+        var outputDir = Path.Combine(jsonDir, material.Name).Replace('\\', '/');
+
+        var decompiler = UserSettings.Default.HLSLDecompilerPath;
+        var export = MaterialShaderExporter.Export(Provider, material, outputDir, decompiler);
+
+        foreach (var msg in export.Messages)
+            Log.Information("[ShaderExport] {Msg}", msg);
+
+        if (export.DxilDumped == 0)
+        {
+            FLogger.Append(ELog.Warning, () => FLogger.Text(
+                $"No shader bytecode could be extracted for '{material.Name}'. See the log for details.", Constants.WHITE, true));
+            return;
+        }
+
+        Interlocked.Add(ref ExportedCount, export.DxilDumped);
+        var hasDecompiler = !string.IsNullOrEmpty(decompiler) && File.Exists(decompiler);
+        FLogger.Append(ELog.Information, () =>
+        {
+            if (hasDecompiler)
+                FLogger.Text($"Exported {export.DxilDumped} shader(s) for {material.Name} ({export.HlslDecompiled} HLSL, {export.HlslFailed} failed) to ", Constants.WHITE);
+            else
+                FLogger.Text($"Exported {export.DxilDumped} shader bytecode file(s) for {material.Name} to ", Constants.WHITE);
+            FLogger.Link(material.Name, export.OutputDirectory, true);
+        });
+
+        if (!hasDecompiler)
+        {
+            FLogger.Append(ELog.Information, () => FLogger.Text(
+                "Tip: set 'HLSL Decompiler Path' in Settings > Advanced to auto-decompile the extracted DXIL/DXBC to HLSL.",
+                Constants.WHITE, true));
+        }
+    }
+
+    /// <summary>
     /// Thread-safe bulk extraction that bypasses UI operations (TabControl, SnooperViewer, etc.).
     /// Used by BulkFolder for parallel folder exports (Models, Animations, Textures, Audio, etc.)
     /// </summary>
@@ -1118,7 +1506,7 @@ public class CUE4ParseViewModel : ViewModel
 
                 for (var i = result.InclusiveStart; i < result.ExclusiveEnd; i++)
                 {
-                    if (CheckExportBulk(cancellationToken, result.Package, i, bulk))
+                    if (CheckExportBulk(cancellationToken, result.Package, i, bulk, entry))
                         break;
                 }
 
@@ -1246,7 +1634,7 @@ public class CUE4ParseViewModel : ViewModel
     /// Bypasses all UI operations (TabControl, SnooperViewer).
     /// Only handles save operations (meshes, animations, textures, audio).
     /// </summary>
-    private bool CheckExportBulk(CancellationToken cancellationToken, IPackage pkg, int index, EBulkType bulk = EBulkType.None)
+    private bool CheckExportBulk(CancellationToken cancellationToken, IPackage pkg, int index, EBulkType bulk = EBulkType.None, GameFile? entry = null)
     {
         var saveTextures = HasFlag(bulk, EBulkType.Textures);
         var saveAudio = HasFlag(bulk, EBulkType.Audio);
@@ -1259,7 +1647,7 @@ public class CUE4ParseViewModel : ViewModel
         {
             case UTexture when (saveTextures) && pointer.Object.Value is UTexture texture:
             {
-                SaveTextureBulk(texture);
+                SaveTextureBulk(texture, entry);
                 return false;
             }
             case UStaticMesh when HasFlag(bulk, EBulkType.Meshes):
@@ -1268,6 +1656,14 @@ public class CUE4ParseViewModel : ViewModel
             case UAnimSequenceBase when HasFlag(bulk, EBulkType.Animations):
             {
                 SaveExport(pointer.Object.Value, false);
+                // Also export the full properties JSON of any materials (Material/MI/MIC) referenced by this mesh.
+                // These run regardless of whether the mesh itself was skipped (SkipExistingExports),
+                // so referenced materials/textures that are still missing on disk get exported.
+                if (HasFlag(bulk, EBulkType.Meshes))
+                {
+                    SaveReferencedMaterialsJson(pointer.Object.Value);
+                    ExportReferencedMaterialTextures(pointer.Object.Value);
+                }
                 return true;
             }
             case UAkMediaAssetData when saveAudio:
@@ -1470,8 +1866,15 @@ public class CUE4ParseViewModel : ViewModel
     /// <summary>
     /// Thread-safe texture saving for bulk parallel export.
     /// </summary>
-    private void SaveTextureBulk(UTexture texture)
+    private void SaveTextureBulk(UTexture texture, GameFile entry)
     {
+        // Thread-safe de-duplication: the same texture may be referenced by many meshes/materials.
+        // Only the first thread to claim this key proceeds; others skip entirely (before the expensive Decode),
+        // which removes both redundant decoding and the write race condition on the same output file.
+        var dedupKey = (texture.Owner?.Name ?? "") + "/" + texture.Name;
+        if (!ExportedTextureKeys.TryAdd(dedupKey, 0))
+            return;
+
         var img = texture is UTexture2DArray textureArray
             ? textureArray.DecodeTextureArray(UserSettings.Default.CurrentDir.TexturePlatform)
             : new[] { texture.Decode(UserSettings.Default.CurrentDir.TexturePlatform) };
@@ -1487,8 +1890,10 @@ public class CUE4ParseViewModel : ViewModel
             if (img[i] is null) continue;
 
             var exportName = appendLayerNumber ? $"{texture.Name}_{i}" : texture.Name;
+            // Use the GameFile's Directory (e.g. "/Game/Textures") — NOT the package Name,
+            // which is just the asset name without any path information.
             var dir = UserSettings.Default.KeepDirectoryStructure
-                ? texture.Owner?.Name?.SubstringBeforeLast('.') ?? ""
+                ? entry.Directory
                 : "";
             var baseDir = UserSettings.Default.TextureDirectory;
 
@@ -2192,9 +2597,153 @@ public class CUE4ParseViewModel : ViewModel
         });
     }
 
+    /// <summary>
+    /// Exports the textures referenced by every material of a mesh (following the MI parent chain),
+    /// INDEPENDENTLY of whether the mesh itself was exported or skipped. Textures go to the Model dir
+    /// (same as MaterialExporter2 during a normal mesh export) and use the same de-dup, so already
+    /// present textures are skipped and only missing ones are written. This fixes the case where a
+    /// skipped mesh (SkipExistingExports) would otherwise never top-up its still-missing textures.
+    /// </summary>
+    private void ExportReferencedMaterialTextures(UObject meshExport)
+    {
+        ResolvedObject?[] materials = meshExport switch
+        {
+            UStaticMesh sm => sm.Materials,
+            USkeletalMesh sk => sk.Materials,
+            _ => []
+        };
+        if (materials is null || materials.Length == 0) return;
+
+        var modelDir = new DirectoryInfo(UserSettings.Default.ModelDirectory);
+        foreach (var resolved in materials)
+        {
+            UMaterialInterface? material;
+            try { material = resolved?.Load() as UMaterialInterface; }
+            catch { continue; }
+
+            var current = material;
+            var guard = 0;
+            while (current is not null && guard++ < 16)
+            {
+                try
+                {
+                    var exporter = new CUE4Parse_Conversion.Materials.MaterialExporter2(current, UserSettings.Default.ExportOptions);
+                    exporter.TryWriteTexturesOnly(modelDir);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Failed to export textures for material '{Name}'", current.Name);
+                }
+                current = (current as UMaterialInstance)?.Parent as UMaterialInterface;
+            }
+        }
+    }
+
+    /// <summary>
+    /// De-dup set for material property JSONs exported alongside meshes during a bulk run.
+    /// </summary>
+    public readonly ConcurrentDictionary<string, byte> ExportedMaterialJsonKeys = new();
+
+    /// <summary>
+    /// Exports the full properties JSON of every material (Material/MI/MIC) referenced by a mesh,
+    /// following the parent chain (MI -> parent MI/MIC -> base Material).
+    /// JSONs are written to the Properties directory, mirroring "Save Properties".
+    /// </summary>
+    private void SaveReferencedMaterialsJson(UObject meshExport)
+    {
+        ResolvedObject?[] materials = meshExport switch
+        {
+            UStaticMesh sm => sm.Materials,
+            USkeletalMesh sk => sk.Materials,
+            _ => []
+        };
+        if (materials is null || materials.Length == 0) return;
+
+        foreach (var resolved in materials)
+        {
+            try
+            {
+                if (resolved?.Load() is UMaterialInterface material)
+                    SaveMaterialChainJson(material);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Failed to export referenced material JSON");
+            }
+        }
+    }
+
+    private void SaveMaterialChainJson(UMaterialInterface material)
+    {
+        // Export this material's package properties JSON (de-duplicated), then recurse into its parent.
+        var owner = material.Owner;
+        if (owner is null) return;
+
+        var packageName = owner.Name; // e.g. /Game/.../MI_Foo
+        if (!ExportedMaterialJsonKeys.TryAdd(packageName, 0))
+            return; // already exported in this run
+
+        try
+        {
+            // Resolve the material package file entry. owner.Name is a UE logical path like
+            // "/Game/.../MI_Foo"; the real key in Provider.Files uses the on-disk mount path
+            // (e.g. "SLASHER/Content/.../MI_Foo"). We MUST run it through FixPath first, exactly like
+            // mesh/texture export does — otherwise the "/Game/..." lookup never matches and entry stays
+            // null, so the full material JSON was never written (root cause of "4 to export / 0 exported").
+            var fixedPath = (owner.Provider?.FixPath(packageName) ?? packageName).SubstringBeforeLast('.');
+            var lookupBase = fixedPath;
+            GameFile? entry = null;
+            foreach (var ext in new[] { ".uasset", ".umap" })
+            {
+                var key = (lookupBase.StartsWith('/') ? lookupBase[1..] : lookupBase) + ext;
+                if (Provider.Files.TryGetValue(key, out entry) || Provider.Files.TryGetValue(lookupBase + ext, out entry))
+                    break;
+                entry = null;
+            }
+
+            if (entry != null)
+            {
+                var jsonPath = Path.Combine(UserSettings.Default.PropertiesDirectory,
+                    UserSettings.Default.KeepDirectoryStructure ? entry.Directory : entry.Directory.SubstringAfterLast('/'),
+                    Path.ChangeExtension(entry.Name, ".json")).Replace('\\', '/');
+
+                if (!UserSettings.Default.SkipExistingExports || !File.Exists(jsonPath))
+                {
+                    var result = Provider.GetLoadPackageResult(entry);
+                    Directory.CreateDirectory(jsonPath.SubstringBeforeLast('/'));
+                    File.WriteAllText(jsonPath, JsonConvert.SerializeObject(result.GetDisplayData(true), Formatting.Indented));
+                    Interlocked.Increment(ref ExportedCount);
+                    Interlocked.Increment(ref ExportedMaterialCount);
+                    Log.Information("Successfully saved material JSON {FilePath}", jsonPath);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to serialize material package '{Package}'", packageName);
+        }
+
+        // Recurse into parent (MI -> parent MI/MIC -> base Material)
+        if (material is UMaterialInstance instance && instance.Parent is UMaterialInterface parent)
+            SaveMaterialChainJson(parent);
+    }
+
     private void SaveExport(UObject export, bool updateUi = true)
     {
-        // Skip if file already exists and user wants to skip
+        // Step 1 — in-memory (per-bulk-run) de-duplication: the same mesh may be referenced/visited
+        // more than once in a single bulk run. The first thread to claim its key proceeds; others skip
+        // before doing any work. This mirrors the texture/material de-dup and is done BEFORE the on-disk
+        // check, matching the required order: collect (memory de-dup) first, then check disk.
+        // updateUi==false marks a bulk run (folder export); single double-click exports keep old behavior.
+        if (!updateUi)
+        {
+            var meshKey = (export.Owner?.Provider?.FixPath(export.Owner?.Name ?? export.GetPathName()) ?? export.GetPathName())
+                .SubstringBeforeLast('.') + "/" + export.Name;
+            if (!ExportedMeshKeys.TryAdd(meshKey, 0))
+                return;
+        }
+
+        // Step 2 — on-disk de-duplication: skip if the output file already exists and the user opted in.
         if (UserSettings.Default.SkipExistingExports)
         {
             var exportSavePath = ExporterBase.GetExportSavePath(
@@ -2229,7 +2778,16 @@ public class CUE4ParseViewModel : ViewModel
         if (toSave.TryWriteToDir(toSaveDirectory, out var label, out var savedFilePath))
         {
             Interlocked.Increment(ref ExportedCount);
+            var meshDone = Interlocked.Increment(ref ExportedMeshCount);
             Log.Information("Successfully saved {FilePath}", savedFilePath);
+            // Periodic progress report during bulk "Save Models" runs.
+            if (meshDone % MeshProgressLogInterval == 0)
+            {
+                FLogger.Append(ELog.Information, () =>
+                {
+                    FLogger.Text($"Exported {meshDone} models so far...", Constants.WHITE, true);
+                });
+            }
             if (updateUi)
             {
                 FLogger.Append(ELog.Information, () =>

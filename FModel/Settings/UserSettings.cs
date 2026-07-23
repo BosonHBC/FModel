@@ -268,7 +268,7 @@ namespace FModel.Settings
             set => SetProperty(ref _readScriptData, value);
         }
 
-        private bool _readShaderMaps;
+        private bool _readShaderMaps = true;
         public bool ReadShaderMaps
         {
             get => _readShaderMaps;
@@ -582,6 +582,13 @@ namespace FModel.Settings
         {
             get => _bulkExportMaxDegreeOfParallelism;
             set => SetProperty(ref _bulkExportMaxDegreeOfParallelism, value);
+        }
+
+        private string _hlslDecompilerPath = @"I:\HLSL-Decompiler\build\Release\HLSLDecompiler.exe";
+        public string HLSLDecompilerPath
+        {
+            get => _hlslDecompilerPath;
+            set => SetProperty(ref _hlslDecompilerPath, value);
         }
 
         private bool _featurePreviewNewAssetExplorer = true;

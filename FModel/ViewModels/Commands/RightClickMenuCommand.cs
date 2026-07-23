@@ -32,6 +32,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
         Metadata,
         References,
         Decompile,
+        Shaders,
     }
 
     public override async void Execute(ApplicationViewModel contextViewModel, object parameter)
@@ -62,6 +63,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
             "Assets_Show_Metadata" => (EAction.Show, EShowAssetType.Metadata, EBulkType.None),
             "Assets_Show_References" => (EAction.Show, EShowAssetType.References, EBulkType.None),
             "Assets_Decompile" => (EAction.Show, EShowAssetType.Decompile, EBulkType.Code),
+            "Assets_Export_Shaders" => (EAction.Show, EShowAssetType.Shaders, EBulkType.None),
 
             "Save_Data" => (EAction.Export, EShowAssetType.None, EBulkType.Raw),
             "Save_Properties" => (EAction.Export, EShowAssetType.None, EBulkType.Properties),
@@ -76,6 +78,11 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
 
         Interlocked.Exchange(ref contextViewModel.CUE4Parse.ExportedCount, 0);
         Interlocked.Exchange(ref contextViewModel.CUE4Parse.FailedExportCount, 0);
+        Interlocked.Exchange(ref contextViewModel.CUE4Parse.ExportedMeshCount, 0);
+        Interlocked.Exchange(ref contextViewModel.CUE4Parse.ExportedMaterialCount, 0);
+        contextViewModel.CUE4Parse.ExportedTextureKeys.Clear();
+        contextViewModel.CUE4Parse.ExportedMaterialJsonKeys.Clear();
+        CUE4Parse_Conversion.Materials.MaterialExporter2.ExportedTextureKeys.Clear();
         await _threadWorkerView.Begin(cancellationToken =>
         {
             if (action is EAction.Show)
@@ -89,6 +96,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
                     EShowAssetType.Metadata => entry => contextViewModel.CUE4Parse.ShowMetadata(entry),
                     EShowAssetType.Decompile => entry => contextViewModel.CUE4Parse.Decompile(entry),
                     EShowAssetType.References => entry => contextViewModel.CUE4Parse.FindReferences(entry),
+                    EShowAssetType.Shaders => entry => contextViewModel.CUE4Parse.ExportMaterialShaders(cancellationToken, entry),
                     _ => throw new ArgumentOutOfRangeException("Unsupported asset action type."),
                 };
 
@@ -126,7 +134,48 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
             foreach (var folder in folders)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                // Pre-scan pass: collect how many resources match, how many are already exported,
+                // and how many still need exporting — then log it before doing the actual export.
+                if (bulktype is EBulkType.Properties or EBulkType.Textures or EBulkType.Meshes or EBulkType.Animations)
+                {
+                    var scanFolder = folder;
+                    FLogger.Append(ELog.Information, () =>
+                    {
+                        FLogger.Text($"Collecting {filetype} in {scanFolder.PathAtThisPoint}...", Constants.WHITE, true);
+                    });
+
+                    var stats = contextViewModel.CUE4Parse.CollectBulkStats(cancellationToken, folder, bulktype | EBulkType.Auto);
+                    FLogger.Append(ELog.Information, () =>
+                    {
+                        FLogger.Text($"Collected {stats.Total} {filetype} in {scanFolder.PathAtThisPoint} — {stats.AlreadyExported} already exported, {stats.ToExport} to export", Constants.WHITE, true);
+                    });
+
+                    // For Save Models, also report the referenced materials and textures discovered.
+                    if (bulktype is EBulkType.Meshes)
+                    {
+                        var s = stats;
+                        FLogger.Append(ELog.Information, () =>
+                        {
+                            FLogger.Text($"  ↳ referenced materials: {s.MaterialTotal} total — {s.MaterialAlreadyExported} already exported, {s.MaterialToExport} to export", Constants.WHITE, true);
+                            FLogger.Text($"  ↳ referenced textures: {s.TextureTotal} total — {s.TextureAlreadyExported} already exported, {s.TextureToExport} to export", Constants.WHITE, true);
+                        });
+                    }
+                }
+
                 folderAction(folder);
+
+                // For Save Models, LogExport reports the combined count (meshes + material JSON).
+                // Add an explicit breakdown so the user sees meshes vs materials separately.
+                if (bulktype is EBulkType.Meshes)
+                {
+                    var meshDone = contextViewModel.CUE4Parse.ExportedMeshCount;
+                    var matDone = contextViewModel.CUE4Parse.ExportedMaterialCount;
+                    FLogger.Append(ELog.Information, () =>
+                    {
+                        FLogger.Text($"Models export finished: {meshDone} models + {matDone} material JSON exported", Constants.WHITE, true);
+                    });
+                }
 
                 var path = Path.Combine(dirType, UserSettings.Default.KeepDirectoryStructure ? folder.PathAtThisPoint : folder.PathAtThisPoint.SubstringAfterLast('/')).Replace('\\', '/');
                 LogExport(contextViewModel, folder.PathAtThisPoint, path, dirType, filetype);
@@ -189,5 +238,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
 
         Interlocked.Exchange(ref contextViewModel.CUE4Parse.ExportedCount, 0);
         Interlocked.Exchange(ref contextViewModel.CUE4Parse.FailedExportCount, 0);
+        Interlocked.Exchange(ref contextViewModel.CUE4Parse.ExportedMeshCount, 0);
+        Interlocked.Exchange(ref contextViewModel.CUE4Parse.ExportedMaterialCount, 0);
     }
 }

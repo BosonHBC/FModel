@@ -130,6 +130,20 @@ public partial class SettingsView
         _applicationView.SettingsView.MappingEndpoint.FilePath = openFileDialog.FileName;
     }
 
+    private void OnBrowseHLSLDecompiler(object sender, RoutedEventArgs e)
+    {
+        var openFileDialog = new OpenFileDialog
+        {
+            Title = "Select HLSL-Decompiler executable",
+            Filter = "Executable (*.exe)|*.exe|All Files (*.*)|*.*"
+        };
+
+        if (!openFileDialog.ShowDialog().GetValueOrDefault())
+            return;
+
+        UserSettings.Default.HLSLDecompilerPath = openFileDialog.FileName;
+    }
+
     private bool TryBrowse(out string path)
     {
         var folderBrowser = new VistaFolderBrowserDialog { ShowNewFolderButton = false };

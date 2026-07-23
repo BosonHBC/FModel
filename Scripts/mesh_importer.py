@@ -30,19 +30,92 @@ TEXTURE_ROLE_HINTS = {
     '_N': 'Normalmap',
     '_ORM': 'Masks',
     '_M': 'Masks',
-    '_C': 'Default',
-    '_A': 'Default',
+    '_C': 'Masks',   # Cavity/Convex - linear data, not color
+    '_A': 'Default', # Albedo - color
 }
 
-# Texture parameter name patterns in material JSON -> role
-# Based on observed material JSON structure
-TEX_PARAM_ROLES = {
-    'PM_Diffuse': 'diffuse', 'Base_Albedo': 'diffuse', 'Albedo': 'diffuse',
-    'PM_Normals': 'normal', 'Normals': 'normal', 'Normal': 'normal',
-    'PM_SpecularMasks': 'orm', 'ORM': 'orm',
-    'Masks': 'mask',
-    'Convex_Convace_Thickness': 'mask',
+# Texture parameter name → full connection spec
+# This is the primary source of truth for how textures connect to material outputs.
+# Derived from Master Material parameter names observed in FModel exports.
+PARAM_CONNECTIONS = {
+    'Base_Albedo': {
+        'role': 'diffuse', 'srgb': True,
+        'compression': 'unreal.TextureCompressionSettings.TC_Default',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_BASE_COLOR')],
+    },
+    'Albedo': {
+        'role': 'diffuse', 'srgb': True,
+        'compression': 'unreal.TextureCompressionSettings.TC_Default',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_BASE_COLOR')],
+    },
+    'PM_Diffuse': {
+        'role': 'diffuse', 'srgb': True,
+        'compression': 'unreal.TextureCompressionSettings.TC_Default',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_BASE_COLOR')],
+    },
+    'Normals': {
+        'role': 'normal', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Normalmap',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_NORMAL')],
+    },
+    'Normal': {
+        'role': 'normal', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Normalmap',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_NORMAL')],
+    },
+    'PM_Normals': {
+        'role': 'normal', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Normalmap',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_NORMAL')],
+    },
+    'ORM': {
+        'role': 'orm', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Masks',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [
+            ('R', 'unreal.MaterialProperty.MP_AMBIENT_OCCLUSION'),
+            ('G', 'unreal.MaterialProperty.MP_ROUGHNESS'),
+            ('B', 'unreal.MaterialProperty.MP_METALLIC'),
+        ],
+    },
+    'PM_SpecularMasks': {
+        'role': 'orm', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Masks',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [
+            ('R', 'unreal.MaterialProperty.MP_AMBIENT_OCCLUSION'),
+            ('G', 'unreal.MaterialProperty.MP_ROUGHNESS'),
+            ('B', 'unreal.MaterialProperty.MP_METALLIC'),
+        ],
+    },
+    'Convex_Convace_Thickness': {
+        'role': 'mask', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Masks',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [],  # Cavity/curvature mask - not directly connected to a standard output
+    },
+    'Masks': {
+        'role': 'mask', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Masks',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [],  # Generic mask - not directly connected
+    },
+    'Mask': {
+        'role': 'mask', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Masks',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [],
+    },
 }
+
+# Backward-compatible role lookup (param_name → role string)
+TEX_PARAM_ROLES = {k: v['role'] for k, v in PARAM_CONNECTIONS.items()}
 
 
 # ======================== Database Helper ========================
@@ -166,10 +239,10 @@ def find_texture_file(ue_path, fmodel_root):
     return None
 
 
-def find_material_json(ue_path, fmodel_root):
+def find_material_json(ue_path, fmodel_root, prefer_raw=False):
     """Find the material JSON file for a given UE material path.
-    Prefers the simplified format (dict with Textures/Parameters keys) over
-    the FModel raw export format (list with Properties/TextureParameterValues)."""
+    By default prefers the simplified format (dict with Textures/Parameters keys).
+    If prefer_raw=True, prefers the FModel raw export format (list with Properties)."""
     rel = ue_path.replace('/Game/', '', 1) if ue_path.startswith('/Game/') else ue_path
     candidates = []
     for root in get_fmodel_roots(fmodel_root):
@@ -178,23 +251,40 @@ def find_material_json(ue_path, fmodel_root):
             candidates.append(json_path)
     if not candidates:
         return None
-    # Prefer the one with simplified format
-    for jp in candidates:
-        try:
-            with open(jp, 'r', encoding='utf-8-sig') as f:
-                data = json.load(f)
-            if isinstance(data, dict) and 'Textures' in data:
-                return jp
-        except Exception:
-            pass
+    
+    if prefer_raw:
+        # Prefer FModel raw format (list with Properties/CachedExpressionData)
+        for jp in candidates:
+            try:
+                with open(jp, 'r', encoding='utf-8-sig') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    for e in data:
+                        if isinstance(e, dict) and ('Properties' in e or 'CachedExpressionData' in e):
+                            return jp
+            except Exception:
+                pass
+    else:
+        # Prefer the one with simplified format
+        for jp in candidates:
+            try:
+                with open(jp, 'r', encoding='utf-8-sig') as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and 'Textures' in data:
+                    return jp
+            except Exception:
+                pass
     return candidates[0]
 
 
 def guess_texture_role(name):
     """Guess texture role from filename suffix."""
     n = name.upper()
-    for suffix, role in [('_ORM', 'orm'), ('_N', 'normal'), ('_M', 'mask'),
-                          ('_C', 'diffuse'), ('_A', 'diffuse')]:
+    for suffix, role in [('_ORM', 'orm'), ('_NORMAL', 'normal'), ('_N', 'normal'),
+                          ('_DISPLACEMENT', 'mask'), ('_HEIGHT', 'mask'),
+                          ('_M', 'mask'), ('_C', 'mask'),
+                          ('_ALBEDO', 'diffuse'), ('_BASECOLOR', 'diffuse'),
+                          ('_A', 'diffuse')]:
         if n.endswith(suffix):
             return role
     # Check for common keywords
@@ -205,6 +295,143 @@ def guess_texture_role(name):
     if 'MASK' in n:
         return 'mask'
     return 'diffuse'
+
+
+def resolve_master_material(mat_ue_path, fmodel_root):
+    """Follow the Parent chain in material JSON to find the root Master Material.
+    Returns (master_json_path, master_json_data) or (None, None) if not found."""
+    visited = set()
+    current_path = mat_ue_path
+    while current_path and current_path not in visited:
+        visited.add(current_path)
+        json_file = find_material_json(current_path, fmodel_root, prefer_raw=True)
+        if not json_file:
+            break
+        try:
+            with open(json_file, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+        except Exception:
+            break
+        
+        # Handle both simplified and FModel raw formats
+        parent_path = None
+        
+        if isinstance(data, list):
+            # FModel raw format: look for Properties.Parent
+            for e in data:
+                if isinstance(e, dict) and 'Properties' in e:
+                    parent = e['Properties'].get('Parent', {})
+                    obj_path = parent.get('ObjectPath', '') if isinstance(parent, dict) else ''
+                    if obj_path:
+                        parent_path = norm_path(obj_path)
+                        break
+        elif isinstance(data, dict):
+            # Simplified format: may have 'Parent' key directly
+            parent_ref = data.get('Parent', '')
+            if isinstance(parent_ref, str) and parent_ref:
+                parent_path = norm_path(parent_ref)
+            elif isinstance(parent_ref, dict):
+                obj_path = parent_ref.get('ObjectPath', '')
+                if obj_path:
+                    parent_path = norm_path(obj_path)
+        
+        if not parent_path:
+            # No parent - this IS the master material
+            return json_file, data
+        current_path = parent_path
+    return None, None
+
+
+def get_param_connection(param_name, master_conn_map=None):
+    """Look up how a texture parameter connects to material outputs.
+    If master_conn_map is provided (built from Master Material JSON), use it.
+    Otherwise fall back to PARAM_CONNECTIONS or param name heuristics."""
+    if master_conn_map and param_name in master_conn_map:
+        return master_conn_map[param_name]
+    conn = PARAM_CONNECTIONS.get(param_name)
+    if conn:
+        return conn
+    # Fallback: try to infer from param name
+    pn = param_name.lower()
+    if 'albedo' in pn or 'diffuse' in pn or 'base' in pn or 'color' in pn:
+        return PARAM_CONNECTIONS['Base_Albedo']
+    if 'normal' in pn or 'norm' in pn:
+        return PARAM_CONNECTIONS['Normals']
+    if 'orm' in pn or 'roughness' in pn or 'specular' in pn:
+        return PARAM_CONNECTIONS['ORM']
+    if 'mask' in pn or 'cavity' in pn or 'convex' in pn or 'thickness' in pn:
+        return PARAM_CONNECTIONS['Masks']
+    # Unknown - treat as color/diffuse by default
+    return {
+        'role': 'diffuse', 'srgb': True,
+        'compression': 'unreal.TextureCompressionSettings.TC_Default',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_BASE_COLOR')],
+    }
+
+
+def build_param_connections_from_master(master_json_data):
+    """Build a deterministic param_name → connection spec mapping from Master Material JSON.
+    
+    Parses CachedExpressionData.RuntimeEntries[3].ParameterInfoSet (texture param names)
+    and CachedExpressionData.TextureValues (default textures, by index correspondence)
+    to determine each parameter's role from the default texture's filename suffix.
+    
+    This is NOT guessing — it uses the actual default textures assigned in the Master Material
+    to deterministically determine what data each parameter carries.
+    """
+    entries = master_json_data if isinstance(master_json_data, list) else [master_json_data]
+    param_names = []
+    default_textures = []
+    
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        cached = e.get('CachedExpressionData', {})
+        # RuntimeEntries[3] = texture parameters
+        re3 = cached.get('RuntimeEntries[3]', {})
+        for p in re3.get('ParameterInfoSet', []):
+            param_names.append(p.get('Name', ''))
+        # TextureValues = default textures (same index order as RuntimeEntries[3])
+        for tv in cached.get('TextureValues', []):
+            default_textures.append(os.path.basename(tv.get('AssetPathName', '')))
+    
+    conn_map = {}
+    for i, pname in enumerate(param_names):
+        default_tex = default_textures[i] if i < len(default_textures) else ''
+        # Derive role from default texture suffix — this is deterministic
+        role = guess_texture_role(default_tex) if default_tex else None
+        # If suffix-based detection is inconclusive, use param name semantics
+        if not role or role == 'diffuse':
+            pn = pname.lower()
+            if 'normal' in pn:
+                role = 'normal'
+            elif 'orm' in pn or 'roughness' in pn or 'specular' in pn:
+                role = 'orm'
+            elif 'mask' in pn or 'cavity' in pn or 'convex' in pn or 'thickness' in pn or 'height' in pn or 'displacement' in pn:
+                role = 'mask'
+            elif 'albedo' in pn or 'base' in pn or 'color' in pn or 'sand' in pn:
+                role = 'diffuse'
+            elif not role:
+                role = 'diffuse'
+        conn = _role_to_connection(role)
+        conn_map[pname] = conn
+    
+    return conn_map
+
+
+def _role_to_connection(role):
+    """Map a texture role to a full connection spec."""
+    for conn in PARAM_CONNECTIONS.values():
+        if conn['role'] == role:
+            return conn
+    # Fallback
+    return {
+        'role': 'diffuse', 'srgb': True,
+        'compression': 'unreal.TextureCompressionSettings.TC_Default',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_BASE_COLOR')],
+    }
 
 
 def type_color(t):
@@ -363,20 +590,46 @@ class RefResolver:
                                             if param_name and tex_path and tex_path.startswith('/Game/'):
                                                 textures[param_name] = tex_path
                                 break
+                    
+                    # Resolve Master Material to build deterministic param connection map
+                    master_path, master_data = resolve_master_material(mat_path, self.fmodel_root)
+                    param_conn_map = None
+                    if master_data:
+                        param_conn_map = build_param_connections_from_master(master_data)
+                    
+                    # Build a set of valid param names from master material
+                    valid_param_names = set(param_conn_map.keys()) if param_conn_map else None
+                    
+                    # Track which textures we've already assigned to avoid duplicates
+                    seen_tex_in_section = set()
+                    
                     for param_name, tex_path in textures.items():
                         if not isinstance(tex_path, str) or not tex_path:
                             continue
                         tex_norm = norm_path(tex_path)
                         if tex_norm.startswith('/Script/') or tex_norm.startswith('/Engine/'):
                             continue
+                        # Filter: if we have a master material param map, only accept
+                        # param names that exist in it. This excludes junk keys like
+                        # texture filenames (T_Tiles_A_Bake_02_M) and legacy aliases
+                        # (PM_Diffuse) that don't match the master material's actual params.
+                        if valid_param_names is not None and param_name not in valid_param_names:
+                            continue
+                        # Deduplicate: skip if this texture was already assigned via another param
+                        if tex_norm in seen_tex_in_section:
+                            continue
+                        seen_tex_in_section.add(tex_norm)
                         tex_local = find_texture_file(tex_norm, self.fmodel_root)
-                        role = TEX_PARAM_ROLES.get(param_name, guess_texture_role(os.path.basename(tex_norm)))
-                        if role not in section['textures']:  # first occurrence wins
-                            section['textures'][role] = {
+                        conn = get_param_connection(param_name, param_conn_map)
+                        role = conn['role']
+                        # Store by param_name for accurate material building
+                        if param_name not in section['textures']:
+                            section['textures'][param_name] = {
                                 'ue_path': tex_norm,
                                 'local_file': tex_local,
                                 'name': os.path.basename(tex_norm),
                                 'param_name': param_name,
+                                'role': role,
                             }
                         if tex_norm not in seen_textures:
                             result['all_textures'].append({
@@ -384,6 +637,7 @@ class RefResolver:
                                 'local_file': tex_local,
                                 'name': os.path.basename(tex_norm),
                                 'role': role,
+                                'param_name': param_name,
                             })
                             seen_textures[tex_norm] = True
                 except Exception:
@@ -406,8 +660,9 @@ class UEImportBuilder:
     """Builds Python command strings for UE Remote Execution."""
 
     @staticmethod
-    def import_texture(local_file, dest_ue_path, role='diffuse'):
-        """Build command to import a texture into UE."""
+    def import_texture(local_file, dest_ue_path, param_name='', param_conn_map=None):
+        """Build command to import a texture into UE.
+        Uses param_name + master material data to determine correct compression/sRGB."""
         name = os.path.basename(dest_ue_path)
         dest_dir = os.path.dirname(dest_ue_path)
         # Use forward slashes for UE paths
@@ -415,19 +670,10 @@ class UEImportBuilder:
 
         local_file_fwd = local_file.replace('\\', '/')
 
-        # Map role to UE texture settings
-        if role == 'normal':
-            compression_settings = 'unreal.TextureCompressionSettings.TC_Normalmap'
-            srgb = 'False'
-        elif role == 'orm':
-            compression_settings = 'unreal.TextureCompressionSettings.TC_Masks'
-            srgb = 'False'
-        elif role == 'mask':
-            compression_settings = 'unreal.TextureCompressionSettings.TC_Masks'
-            srgb = 'False'
-        else:
-            compression_settings = 'unreal.TextureCompressionSettings.TC_Default'
-            srgb = 'True'
+        conn = get_param_connection(param_name, param_conn_map)
+        compression_settings = conn['compression']
+        srgb = 'True' if conn['srgb'] else 'False'
+        role = conn['role']
 
         cmd = f'''
 import unreal
@@ -470,17 +716,13 @@ else:
         return cmd.strip()
 
     @staticmethod
-    def fix_texture_settings(dest_ue_path, role='diffuse'):
-        """Build command to fix texture settings for an already-imported texture."""
-        if role == 'normal':
-            compression_settings = 'unreal.TextureCompressionSettings.TC_Normalmap'
-            srgb = 'False'
-        elif role in ('orm', 'mask'):
-            compression_settings = 'unreal.TextureCompressionSettings.TC_Masks'
-            srgb = 'False'
-        else:
-            compression_settings = 'unreal.TextureCompressionSettings.TC_Default'
-            srgb = 'True'
+    def fix_texture_settings(dest_ue_path, param_name='', param_conn_map=None):
+        """Build command to fix texture settings for an already-imported texture.
+        Uses param_name + master material data to determine correct settings."""
+        conn = get_param_connection(param_name, param_conn_map)
+        compression_settings = conn['compression']
+        srgb = 'True' if conn['srgb'] else 'False'
+        role = conn['role']
 
         cmd = f'''
 import unreal
@@ -535,66 +777,47 @@ result = [str(imported)] if imported else []
         return cmd.strip()
 
     @staticmethod
-    def create_material(dest_ue_path, tex_assignments, material_name=None):
+    def create_material(dest_ue_path, tex_assignments, material_name=None, param_conn_map=None):
         """Build command to create a simple material with textures connected.
-        tex_assignments: list of {ue_path, role, param_name}
+        tex_assignments: list of {ue_path, param_name, role}
+        Connections are driven by param_name via get_param_connection() with master material data.
         """
         name = material_name or os.path.basename(dest_ue_path)
         dest_dir = os.path.dirname(dest_ue_path).replace('\\', '/')
 
-        # Build texture sampler setup commands
+        # Build texture sampler setup commands using param_name-driven connections
         tex_cmds = []
-        for ta in tex_assignments:
-            role = ta.get('role', 'diffuse')
+        y_offset = 0
+        for i, ta in enumerate(tex_assignments):
+            param_name = ta.get('param_name', '')
             tex_path = ta['ue_path']
             tex_obj = tex_path + '.' + os.path.basename(tex_path)
-            if role == 'diffuse':
-                tex_cmds.append(f'''
+
+            conn = get_param_connection(param_name, param_conn_map)
+            sampler_type = conn['sampler_type']
+            connections = conn['connections']
+            # Use a unique variable name per texture to avoid collisions
+            var_name = f"ts_{i}"
+
+            conn_lines = []
+            for channel, mp_prop in connections:
+                conn_lines.append(
+                    f'        unreal.MaterialEditingLibrary.connect_material_property({var_name}, "{channel}", {mp_prop})'
+                )
+            conn_block = '\n'.join(conn_lines) if conn_lines else '        pass  # no direct output connection'
+
+            tex_cmds.append(f'''
 try:
-    tex_{role} = unreal.load_asset("{tex_obj}")
-    if tex_{role}:
-        ts_{role} = unreal.MaterialEditingLibrary.create_material_expression(mat, unreal.MaterialExpressionTextureSample, -400, 0)
-        ts_{role}.set_editor_property("texture", tex_{role})
-        unreal.MaterialEditingLibrary.connect_material_property(ts_{role}, "RGB", unreal.MaterialProperty.MP_BASE_COLOR)
+    tex_obj_{i} = unreal.load_asset("{tex_obj}")
+    if tex_obj_{i}:
+        {var_name} = unreal.MaterialEditingLibrary.create_material_expression(mat, unreal.MaterialExpressionTextureSample, -400, {y_offset})
+        {var_name}.set_editor_property("texture", tex_obj_{i})
+        {var_name}.set_editor_property("sampler_type", {sampler_type})
+{conn_block}
 except Exception as e:
-    print(f"Diffuse tex error: {{e}}")
+    print(f"Texture {{param_name}} error: {{e}}")
 ''')
-            elif role == 'normal':
-                tex_cmds.append(f'''
-try:
-    tex_{role} = unreal.load_asset("{tex_obj}")
-    if tex_{role}:
-        ts_{role} = unreal.MaterialEditingLibrary.create_material_expression(mat, unreal.MaterialExpressionTextureSample, -400, 200)
-        ts_{role}.set_editor_property("texture", tex_{role})
-        ts_{role}.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
-        unreal.MaterialEditingLibrary.connect_material_property(ts_{role}, "RGB", unreal.MaterialProperty.MP_NORMAL)
-except Exception as e:
-    print(f"Normal tex error: {{e}}")
-''')
-            elif role == 'orm':
-                tex_cmds.append(f'''
-try:
-    tex_{role} = unreal.load_asset("{tex_obj}")
-    if tex_{role}:
-        ts_{role} = unreal.MaterialEditingLibrary.create_material_expression(mat, unreal.MaterialExpressionTextureSample, -400, 400)
-        ts_{role}.set_editor_property("texture", tex_{role})
-        ts_{role}.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_COLOR)
-        unreal.MaterialEditingLibrary.connect_material_property(ts_{role}, "R", unreal.MaterialProperty.MP_AMBIENT_OCCLUSION)
-        unreal.MaterialEditingLibrary.connect_material_property(ts_{role}, "G", unreal.MaterialProperty.MP_ROUGHNESS)
-        unreal.MaterialEditingLibrary.connect_material_property(ts_{role}, "B", unreal.MaterialProperty.MP_METALLIC)
-except Exception as e:
-    print(f"ORM tex error: {{e}}")
-''')
-            elif role == 'mask':
-                tex_cmds.append(f'''
-try:
-    tex_{role} = unreal.load_asset("{tex_obj}")
-    if tex_{role}:
-        ts_{role} = unreal.MaterialEditingLibrary.create_material_expression(mat, unreal.MaterialExpressionTextureSample, -400, 600)
-        ts_{role}.set_editor_property("texture", tex_{role})
-except Exception as e:
-    print(f"Mask tex error: {{e}}")
-''')
+            y_offset += 200
 
         # Indent each line by 4 spaces so tex_block stays inside the else: block
         raw_block = '\n'.join(tex_cmds)
@@ -762,12 +985,15 @@ class MeshImporterApp:
 
         ttk.Label(left, text="Search StaticMesh:").pack(anchor='w')
         self.search_var = tk.StringVar()
-        self.search_var.trace('w', lambda *_: self._filter_tree())
+        self.search_var.trace_add('write', lambda *_: self._filter_tree())
         ttk.Entry(left, textvariable=self.search_var).pack(fill='x', pady=(0, 4))
-
+        self.glb_only_var = tk.BooleanVar(value=False)
+        self.glb_only_var.trace_add('write', lambda *_: self._filter_tree())
+        ttk.Checkbutton(left, text="Only show meshes with GLB",
+                        variable=self.glb_only_var).pack(anchor='w', pady=(0, 4))
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill='both', expand=True)
-        self.tree = ttk.Treeview(tree_frame, columns=('type',), show='tree headings')
+        self.tree = ttk.Treeview(tree_frame, columns=('type',), show='tree headings', selectmode='extended')
         self.tree.heading('#0', text='Asset')
         self.tree.heading('type', text='Type')
         self.tree.column('#0', width=200)
@@ -778,6 +1004,7 @@ class MeshImporterApp:
         vsb.pack(side='right', fill='y')
         self.tree.bind('<<TreeviewSelect>>', self._on_tree_select)
         self.tree.bind('<Double-1>', self._on_tree_dblclick)
+        self.tree.bind('<Button-3>', self._tree_right_click)
 
         # Center: reference details
         center = ttk.Frame(main)
@@ -802,6 +1029,8 @@ class MeshImporterApp:
         self.resolve_btn.pack(side='left', padx=4)
         self.import_btn = ttk.Button(btn_frame, text="Import to UE", command=self._start_import, state='disabled')
         self.import_btn.pack(side='left', padx=4)
+        self.batch_import_btn = ttk.Button(btn_frame, text="Batch Import to UE", command=self._start_batch_import, state='normal')
+        self.batch_import_btn.pack(side='left', padx=4)
 
         # Right: log
         right = ttk.Frame(main, width=400)
@@ -813,10 +1042,13 @@ class MeshImporterApp:
         log_frame.pack(fill='both', expand=True)
         self.log_text = tk.Text(log_frame, wrap='word', state='disabled',
                                 bg='#1E1E1E', fg='#88FF88', font=('Consolas', 9))
+        self.log_text.tag_configure('warning', foreground='#FFA500')
+        self.log_text.tag_configure('error', foreground='#FF4444')
         lsb = ttk.Scrollbar(log_frame, orient='vertical', command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=lsb.set)
         self.log_text.pack(side='left', fill='both', expand=True)
         lsb.pack(side='right', fill='y')
+        self.log_text.bind('<Button-3>', self._log_right_click)
 
         # Progress bar
         self.pb = ttk.Progressbar(self.root, mode='determinate')
@@ -843,24 +1075,23 @@ class MeshImporterApp:
             messagebox.showwarning("Connection Failed", "See log panel for details.")
 
     def _refresh_tree(self):
-        self.tree.delete(*self.tree.get_children())
-        self.tree_map.clear()
-        if not self.db:
-            return
-        assets = self.db.search_static_meshes('')
-        for a in assets:
-            item = self.tree.insert('', 'end', text=a['name'], values=(a['type'],))
-            self.tree_map[item] = a['package_path']
+        self._filter_tree()
 
     def _filter_tree(self):
         q = self.search_var.get()
+        glb_only = getattr(self, 'glb_only_var', None) and self.glb_only_var.get()
         self.tree.delete(*self.tree.get_children())
         self.tree_map.clear()
         if not self.db:
             return
         assets = self.db.search_static_meshes(q)
         for a in assets:
-            item = self.tree.insert('', 'end', text=a['name'], values=(a['type'],))
+            exported = a.get('exported', 0)
+            if glb_only and not exported:
+                continue
+            mark = '✓' if exported else '✗'
+            label = f"[{mark}] {a['name']}"
+            item = self.tree.insert('', 'end', text=label, values=(a['type'],))
             self.tree_map[item] = a['package_path']
 
     def _on_tree_select(self, e):
@@ -873,6 +1104,35 @@ class MeshImporterApp:
 
     def _on_tree_dblclick(self, e):
         self._resolve_selected()
+
+    def _tree_right_click(self, e):
+        """Right-click context menu on the asset tree."""
+        item = self.tree.identify_row(e.y)
+        if item:
+            # If the item is not already selected, select only it
+            if item not in self.tree.selection():
+                self.tree.selection_set(item)
+            menu = tk.Menu(self.root, tearoff=0)
+            sel_count = len(self.tree.selection())
+            if sel_count > 1:
+                menu.add_command(label=f"Batch Import to UE ({sel_count} meshes)", command=self._start_batch_import)
+                menu.add_separator()
+            menu.add_command(label="Resolve References", command=self._resolve_selected)
+            menu.add_command(label="Import to UE (single)", command=self._start_import)
+            menu.add_separator()
+            menu.add_command(label="Copy UE Path", command=self._copy_selected_path)
+            menu.tk_popup(e.x_root, e.y_root)
+
+    def _copy_selected_path(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        paths = [self.tree_map.get(s, '') for s in sel]
+        text = '\n'.join(p for p in paths if p)
+        if text:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self._log(f"Copied {len(paths)} path(s) to clipboard")
 
     def _show_asset_info(self, mesh_path):
         self._clear_detail()
@@ -948,124 +1208,140 @@ class MeshImporterApp:
         self.content_root = self.content_var.get()
         self.ue_host = self.host_var.get()
         self.ue_port = int(self.port_var.get())
+        self.fmodel_root = self.fmodel_var.get()
         self.importing = True
         self.import_btn.config(state='disabled')
         self.resolve_btn.config(state='disabled')
+        self.batch_import_btn.config(state='disabled')
         self.pb['value'] = 0
-        t = threading.Thread(target=self._import_worker, daemon=True)
+        mesh_path = self.current_resolution['mesh_path']
+        self._log(f"\n{'='*60}")
+        self._log(f"Single Import (V2 pipeline): {mesh_path}")
+        self._log(f"{'='*60}")
+        t = threading.Thread(target=self._single_import_worker_v2, args=(mesh_path,), daemon=True)
         t.start()
 
-    def _import_worker(self):
-        res = self.current_resolution
-        try:
-            # Step 1: Connect to UE
-            self._log("Connecting to UE...")
-            self.queue.put(('progress', 0, 10, "Connecting to UE..."))
-            client = UERemoteExec(self.ue_host, self.ue_port)
-            if not client.connect(timeout=10):
-                self.queue.put(('error', "Cannot connect to UE. Ensure UE is running with Python Remote Execution enabled."))
-                return
-            self._log("✓ Connected to UE")
+    def _single_import_worker_v2(self, mesh_path):
+        """Worker thread: run V2 MeshImportPipeline for a single mesh."""
+        from mesh_importer_v2 import MeshImportPipeline
 
-            # Collect all import tasks
-            total_steps = 0
-            total_steps += len(res['all_textures'])  # textures
-            total_steps += len(res['all_materials'])  # materials
-            total_steps += 1  # mesh
-            total_steps += 1  # assign materials
-            step = 0
+        mesh_name = os.path.basename(mesh_path)
+        self.queue.put(('progress', 0, 1, f"[1/1] {mesh_name}"))
+        self.queue.put(('log', f"\n--- [1/1] {mesh_name} ---"))
 
-            # Step 2: Import textures
-            for t in res['all_textures']:
-                if not t['local_file']:
-                    self._log(f"  SKIP texture (no file): {t['name']}")
-                    step += 1
-                    continue
-                dest = ue_path_to_import_dest(t['ue_path'], self.content_root)
-                # Check if texture already exists in UE
-                check_cmd = f'__import__("unreal").EditorAssetLibrary.does_asset_exist("{dest}")'
-                r = client.run_command(check_cmd, mode='eval', timeout=30)
-                exists = r.get('success') and str(r.get('result', '')).strip().lower() in ('true', '1')
-                if exists:
-                    # Fix texture settings even if already imported
-                    fix_cmd = UEImportBuilder.fix_texture_settings(dest, t['role'])
-                    client.run_command(fix_cmd, mode='exec', timeout=60)
-                    self._log(f"  SKIP texture (exists, settings fixed): {t['name']}")
-                    step += 1
-                    self.queue.put(('progress', step, total_steps, f"Texture {step}/{len(res['all_textures'])}"))
-                    continue
-                self._log(f"  Importing texture: {t['name']} -> {dest}")
-                cmd = UEImportBuilder.import_texture(t['local_file'], dest, t['role'])
-                r = client.run_command(cmd, mode='exec', timeout=120)
-                if not r.get('success'):
-                    self._log(f"    ⚠ Texture import warning: {r.get('error', '')[:200]}")
-                step += 1
-                self.queue.put(('progress', step, total_steps, f"Texture {step}/{len(res['all_textures'])}"))
-
-            # Step 3: Create materials
-            for m in res['all_materials']:
-                dest = ue_path_to_import_dest(m['ue_path'], self.content_root)
-                # Find the section that uses this material to get texture assignments
-                tex_assignments = []
-                for s in res['sections']:
-                    if s['material_path'] == m['ue_path']:
-                        for role, t in s['textures'].items():
-                            tex_assignments.append({
-                                'ue_path': ue_path_to_import_dest(t['ue_path'], self.content_root),
-                                'role': role,
-                                'param_name': t['param_name'],
-                            })
-                        break
-                self._log(f"  Creating material: {m['name']} -> {dest}")
-                # If material is "IsNull" or empty, still create a simple default material
-                cmd = UEImportBuilder.create_material(dest, tex_assignments)
-                r = client.run_command(cmd, mode='exec', timeout=120)
-                if not r.get('success'):
-                    self._log(f"    ⚠ Material creation warning: {r.get('error', '')[:200]}")
-                step += 1
-                self.queue.put(('progress', step, total_steps, f"Material {step}"))
-
-            # Step 4: Import mesh
-            if res['glb_file']:
-                dest = ue_path_to_import_dest(res['mesh_path'], self.content_root)
-                self._log(f"  Importing mesh: {res['mesh_name']} -> {dest}")
-                cmd = UEImportBuilder.import_mesh(res['glb_file'], dest)
-                r = client.run_command(cmd, mode='exec', timeout=300)
-                if not r.get('success'):
-                    self._log(f"    ⚠ Mesh import warning: {r.get('error', '')[:200]}")
-                else:
-                    self._log(f"    ✓ Mesh imported")
-                step += 1
-                self.queue.put(('progress', step, total_steps, "Mesh imported"))
-            else:
-                self._log("  ⚠ No GLB file, skipping mesh import")
-
-            # Step 5: Assign materials to mesh sections
-            mesh_dest = ue_path_to_import_dest(res['mesh_path'], self.content_root)
-            sections_for_assign = []
-            for s in res['sections']:
-                mat_dest = ue_path_to_import_dest(s['material_path'], self.content_root) if s['found'] else None
-                sections_for_assign.append({
-                    'slot_name': s['slot_name'],
-                    'material_dest_path': mat_dest,
-                    'found': s['found'],
-                })
-            self._log("  Assigning materials to mesh sections...")
-            cmd = UEImportBuilder.assign_material_to_mesh(mesh_dest, sections_for_assign)
-            r = client.run_command(cmd, mode='exec', timeout=120)
-            if not r.get('success'):
-                self._log(f"    ⚠ Assign warning: {r.get('error', '')[:200]}")
-            else:
-                self._log(f"    ✓ {r.get('result', 'Materials assigned')}")
-            step += 1
-            self.queue.put(('progress', step, total_steps, "Done!"))
-
-            client.disconnect()
-            self._log("✓ Import complete!")
+        json_path, glb_path = ue_path_to_local(mesh_path, self.fmodel_root)
+        if not json_path:
+            self.queue.put(('log', f"  ✗ JSON not found for {mesh_path}"))
             self.queue.put(('done',))
+            return
 
+        self.queue.put(('log', f"  JSON: {json_path}"))
+        self.queue.put(('log', f"  GLB:  {glb_path or 'NOT FOUND'}"))
+
+        try:
+            pipeline = MeshImportPipeline(
+                fmodel_root=self.fmodel_root,
+                content_root=self.content_root,
+                ue_host=self.ue_host,
+                ue_port=self.ue_port,
+            )
+            pipeline.log = lambda msg: self.queue.put(('log', msg))
+            ok = pipeline.run(json_path)
+            if ok:
+                self.queue.put(('log', f"  ✓ {mesh_name} imported successfully"))
+            else:
+                self.queue.put(('log', f"  ✗ {mesh_name} import failed"))
         except Exception as e:
-            self.queue.put(('error', str(e)))
+            self.queue.put(('log', f"  ✗ ERROR: {e}"))
+
+        self.queue.put(('done',))
+
+    def _start_batch_import(self):
+        """Start batch import using v2 pipeline for all selected meshes."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Please select one or more StaticMeshes in the list.")
+            return
+        if self.importing:
+            return
+
+        paths = [self.tree_map.get(s) for s in sel]
+        paths = [p for p in paths if p]
+        if not paths:
+            messagebox.showwarning("No Assets", "No valid assets found in selection.")
+            return
+
+        # Confirm with user
+        msg = f"Batch import {len(paths)} meshes using the V2 pipeline?\n\nAssets:\n" + "\n".join(f"  • {os.path.basename(p)}" for p in paths[:10])
+        if len(paths) > 10:
+            msg += f"\n  ... and {len(paths) - 10} more"
+        if not messagebox.askyesno("Batch Import", msg):
+            return
+
+        self.content_root = self.content_var.get()
+        self.ue_host = self.host_var.get()
+        self.ue_port = int(self.port_var.get())
+        self.fmodel_root = self.fmodel_var.get()
+        self.importing = True
+        self.batch_import_btn.config(state='disabled')
+        self.import_btn.config(state='disabled')
+        self.resolve_btn.config(state='disabled')
+        self.pb['value'] = 0
+        self._log(f"\n{'='*60}")
+        self._log(f"Batch Import: {len(paths)} meshes (V2 pipeline)")
+        self._log(f"{'='*60}")
+        t = threading.Thread(target=self._batch_import_worker, args=(paths,), daemon=True)
+        t.start()
+
+    def _batch_import_worker(self, mesh_paths):
+        """Worker thread: run V2 MeshImportPipeline for each selected mesh."""
+        from mesh_importer_v2 import MeshImportPipeline
+
+        total = len(mesh_paths)
+        success_count = 0
+        fail_count = 0
+
+        for idx, mp in enumerate(mesh_paths):
+            mesh_name = os.path.basename(mp)
+            self.queue.put(('progress', idx, total, f"[{idx+1}/{total}] {mesh_name}"))
+            self.queue.put(('log', f"\n--- [{idx+1}/{total}] {mesh_name} ---"))
+
+            # Find the JSON file for this mesh
+            json_path, glb_path = ue_path_to_local(mp, self.fmodel_root)
+            if not json_path:
+                self.queue.put(('log', f"  ✗ JSON not found for {mp}"))
+                fail_count += 1
+                continue
+            if not glb_path:
+                self.queue.put(('log', f"  ⚠ GLB not found, will attempt import anyway"))
+
+            self.queue.put(('log', f"  JSON: {json_path}"))
+            self.queue.put(('log', f"  GLB:  {glb_path or 'NOT FOUND'}"))
+
+            try:
+                pipeline = MeshImportPipeline(
+                    fmodel_root=self.fmodel_root,
+                    content_root=self.content_root,
+                    ue_host=self.ue_host,
+                    ue_port=self.ue_port,
+                )
+                # Override pipeline's log method to feed into UI via queue (thread-safe)
+                pipeline.log = lambda msg: self.queue.put(('log', msg))
+                ok = pipeline.run(json_path)
+                if ok:
+                    success_count += 1
+                    self.queue.put(('log', f"  ✓ {mesh_name} imported successfully"))
+                else:
+                    fail_count += 1
+                    self.queue.put(('log', f"  ✗ {mesh_name} import failed"))
+            except Exception as e:
+                fail_count += 1
+                self.queue.put(('log', f"  ✗ ERROR: {e}"))
+
+        self.queue.put(('log', f"\n{'='*60}"))
+        self.queue.put(('log', f"Batch Import Complete: {success_count} succeeded, {fail_count} failed (of {total})"))
+        self.queue.put(('log', f"{'='*60}"))
+        self.queue.put(('done',))
 
     def _poll(self):
         try:
@@ -1076,17 +1352,21 @@ class MeshImporterApp:
                     self.pb['maximum'] = total
                     self.pb['value'] = cur
                     self.status_var.set(msg)
+                elif m[0] == 'log':
+                    self._log(m[1])
                 elif m[0] == 'done':
                     self.status_var.set("Import complete!")
                     self.importing = False
                     self.import_btn.config(state='normal')
                     self.resolve_btn.config(state='normal')
+                    self.batch_import_btn.config(state='normal')
                 elif m[0] == 'error':
                     self._log(f"✗ ERROR: {m[1]}")
                     self.status_var.set(f"Error: {m[1]}")
                     self.importing = False
                     self.import_btn.config(state='normal')
                     self.resolve_btn.config(state='normal')
+                    self.batch_import_btn.config(state='normal')
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
@@ -1095,8 +1375,24 @@ class MeshImporterApp:
 
     def _log(self, msg):
         self.log_text.config(state='normal')
-        self.log_text.insert('end', msg + '\n')
+        upper = msg.upper()
+        if 'ERROR' in upper or 'FAILED' in upper or '✗' in msg:
+            self.log_text.insert('end', msg + '\n', 'error')
+        elif 'WARN' in upper or 'SKIP' in upper or '⚠' in msg:
+            self.log_text.insert('end', msg + '\n', 'warning')
+        else:
+            self.log_text.insert('end', msg + '\n')
         self.log_text.see('end')
+        self.log_text.config(state='disabled')
+
+    def _log_right_click(self, e):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label='Clear Log', command=self._clear_log)
+        menu.tk_popup(e.x_root, e.y_root)
+
+    def _clear_log(self):
+        self.log_text.config(state='normal')
+        self.log_text.delete('1.0', 'end')
         self.log_text.config(state='disabled')
 
     def _clear_detail(self):
