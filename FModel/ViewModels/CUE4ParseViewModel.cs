@@ -650,35 +650,80 @@ public class CUE4ParseViewModel : ViewModel
     private void BulkFolder(CancellationToken cancellationToken, TreeItem folder, Action<GameFile> action)
     {
         var maxDop = UserSettings.Default.BulkExportMaxDegreeOfParallelism;
-        var options = maxDop > 0
-            ? new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = maxDop }
-            : new ParallelOptions { CancellationToken = cancellationToken };
+        var workerCount = maxDop > 0 ? maxDop : Environment.ProcessorCount;
+        if (workerCount < 1) workerCount = 1;
 
-        // Flatten the whole folder tree into a single work list first, then run ONE Parallel.ForEach.
-        // Previously we called Parallel.ForEach per-folder and only recursed into sub-folders after the
-        // current folder fully finished — that created a barrier at every folder boundary, so a single
-        // slow asset would leave other threads idle instead of letting them pick up sub-folder assets.
-        // With a flat list, any thread that finishes an asset immediately steals the next one from the
-        // global queue regardless of which sub-folder it belongs to (true work-stealing across the tree).
+        // Flatten the whole folder tree into a single work list first.
         var allAssets = new List<GameFile>();
         CollectAssetsRecursive(folder, allAssets);
+        if (allAssets.Count == 0) return;
 
-        Parallel.ForEach(allAssets, options, asset =>
+        // Persistent worker-pool + thread-safe queue model (replaces Parallel.ForEach).
+        //
+        // Why not Parallel.ForEach: its default partitioner hands each thread a *chunk* of contiguous
+        // items at once. If one item in a chunk is slow, the other items in that same chunk are "held"
+        // by that one thread and cannot be picked up by idle threads — so a single long asset stalls a
+        // whole chunk and other workers sit idle (the blocking you observed).
+        //
+        // Here we spin up exactly `workerCount` long-lived worker threads once, and feed them from a
+        // single BlockingCollection (a thread-safe ConcurrentQueue under the hood). Each worker loops:
+        // take the next asset, export it, then immediately take the next — item granularity is 1, so
+        // no worker ever holds more than the single asset it is actively processing. A slow asset only
+        // occupies its own worker; all other workers keep draining the queue with zero barriers.
+        using var queue = new BlockingCollection<GameFile>(new ConcurrentQueue<GameFile>());
+
+        void WorkerLoop()
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
+            // GetConsumingEnumerable blocks when the queue is empty and exits cleanly once the queue is
+            // both empty AND marked complete (CompleteAdding). This is the "finish one -> grab next" loop.
+            foreach (var asset in queue.GetConsumingEnumerable())
             {
-                action(asset);
+                if (cancellationToken.IsCancellationRequested) break;
+                try
+                {
+                    action(asset);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Failed to extract '{FilePath}'", asset.Path);
+                }
             }
-            catch (OperationCanceledException)
+        }
+
+        var workers = new Thread[workerCount];
+        for (var i = 0; i < workerCount; i++)
+        {
+            workers[i] = new Thread(WorkerLoop)
             {
-                throw;
-            }
-            catch (Exception ex)
+                IsBackground = true,
+                Name = $"BulkExportWorker-{i}"
+            };
+            workers[i].Start();
+        }
+
+        // Producer: enqueue every asset, then signal that no more items will be added.
+        try
+        {
+            foreach (var asset in allAssets)
             {
-                Log.Error(ex, "Failed to extract '{FilePath}'", asset.Path);
+                cancellationToken.ThrowIfCancellationRequested();
+                queue.Add(asset);
             }
-        });
+        }
+        finally
+        {
+            queue.CompleteAdding();
+        }
+
+        // Wait for all workers to drain the queue and exit.
+        foreach (var worker in workers)
+            worker.Join();
+
+        cancellationToken.ThrowIfCancellationRequested();
     }
 
     /// <summary>

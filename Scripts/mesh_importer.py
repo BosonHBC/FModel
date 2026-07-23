@@ -126,6 +126,11 @@ class DBHelper:
     def __init__(self, path):
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Migration: add 'ue_imported' column if missing (NULL=not scanned, 1=imported, 0=not imported)
+        try:
+            self.conn.execute('ALTER TABLE assets ADD COLUMN ue_imported INTEGER DEFAULT NULL')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     def get_meta(self, key):
         r = self.conn.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
@@ -145,6 +150,23 @@ class DBHelper:
     def get_by_path(self, pp):
         r = self.conn.execute('SELECT * FROM assets WHERE package_path=?', (pp,)).fetchone()
         return dict(r) if r else None
+
+    def update_ue_imported(self, package_path, val):
+        """Update the ue_imported column for a single asset.
+        val: 1=imported, 0=not imported, None=not scanned"""
+        self.conn.execute('UPDATE assets SET ue_imported=? WHERE package_path=?', (val, package_path))
+        self.conn.commit()
+
+    def batch_update_ue_imported(self, updates):
+        """Batch update ue_imported. updates: dict {package_path: val}"""
+        self.conn.executemany('UPDATE assets SET ue_imported=? WHERE package_path=?',
+                              [(v, k) for k, v in updates.items()])
+        self.conn.commit()
+
+    def get_ue_imported_map(self):
+        """Return {package_path: ue_imported} for all assets."""
+        return {r['package_path']: r['ue_imported'] for r in
+                self.conn.execute('SELECT package_path, ue_imported FROM assets')}
 
     def get_outgoing(self, aid):
         return [dict(r) for r in self.conn.execute(
@@ -184,26 +206,10 @@ def norm_path(p):
 
 def get_fmodel_roots(fmodel_root):
     """Get all possible root directories to search for files.
-    FModel exports have two parallel structures:
-    - Exports/SLASHER/Content/... : JSON metadata files
-    - SLASHER/Content/...         : actual asset files (.glb, .png)
-    We also support the case where everything is under one root.
+    With the unified export root, both JSON metadata and binary assets
+    (.glb, .png) live under the same directory tree.
     """
-    roots = [fmodel_root]
-    # If fmodel_root ends with Exports/xxx/Content, also check parent/xxx/Content
-    norm = fmodel_root.replace('\\', '/')
-    if '/Exports/' in norm:
-        alt = norm.split('/Exports/')[0] + '/' + norm.split('/Exports/', 1)[1]
-        roots.append(alt)
-    # Also check if there's a sibling without Exports prefix
-    parent = os.path.dirname(fmodel_root)
-    if parent and os.path.basename(parent) == 'Exports':
-        gp = os.path.dirname(parent)
-        # grandparent + same subpath after Exports
-        rel = os.path.relpath(fmodel_root, parent)
-        alt2 = os.path.join(gp, rel)
-        roots.append(alt2)
-    return roots
+    return [fmodel_root]
 
 
 def ue_path_to_local(ue_path, fmodel_root):
@@ -934,7 +940,7 @@ class MeshImporterApp:
         self.queue = queue.Queue()
         self.importing = False
         self.ue_client = None
-        self.fmodel_root = self.db.get_meta('last_dir') if self.db else r"I:\FModelOutput\Exports\SLASHER\Content"
+        self.fmodel_root = self.db.get_meta('last_dir') if self.db else r"I:\FModelOutput\Exports"
         self.content_root = "/Game/Developers/bosonhuang/SlasherAsset"
         self.ue_host = "239.0.0.1"
         self.ue_port = 6766
@@ -991,6 +997,9 @@ class MeshImporterApp:
         self.glb_only_var.trace_add('write', lambda *_: self._filter_tree())
         ttk.Checkbutton(left, text="Only show meshes with GLB",
                         variable=self.glb_only_var).pack(anchor='w', pady=(0, 4))
+        self.refresh_ue_btn = ttk.Button(left, text="Refresh UE Import Status",
+                                         command=self._refresh_ue_import_status)
+        self.refresh_ue_btn.pack(fill='x', pady=(0, 4))
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill='both', expand=True)
         self.tree = ttk.Treeview(tree_frame, columns=('type',), show='tree headings', selectmode='extended')
@@ -1074,6 +1083,84 @@ class MeshImporterApp:
                 self._log(line)
             messagebox.showwarning("Connection Failed", "See log panel for details.")
 
+    def _refresh_ue_import_status(self):
+        """Check which meshes have already been imported to UE and update the database."""
+        if self.importing:
+            messagebox.showwarning("Busy", "Import in progress, please wait.")
+            return
+        host = self.host_var.get()
+        port = int(self.port_var.get())
+        content_root = self.content_var.get()
+        if not content_root:
+            messagebox.showwarning("Missing Config", "Please set UE Content Root first.")
+            return
+        self.refresh_ue_btn.config(state='disabled')
+        self._log("\n--- Refreshing UE Import Status ---")
+        self._log(f"  Content Root: {content_root}")
+        t = threading.Thread(target=self._refresh_ue_worker, args=(host, port, content_root), daemon=True)
+        t.start()
+
+    def _refresh_ue_worker(self, host, port, content_root):
+        """Worker thread: query UE for all StaticMesh assets under content_root."""
+        from ue_remote import UERemoteExec
+        try:
+            client = UERemoteExec(host, port)
+            if not client.connect(timeout=15):
+                self.queue.put(('log', "  ✗ Cannot connect to UE"))
+                self.queue.put(('ue_refresh_done', False, "Connection failed"))
+                return
+            self.queue.put(('log', "  Connected, scanning UE assets..."))
+
+            # Query all assets under content_root, filter StaticMesh
+            cmd = f'''
+import unreal
+results = []
+all_paths = unreal.EditorAssetLibrary.list_assets("{content_root}", recursive=True)
+for p in all_paths:
+    ad = unreal.EditorAssetLibrary.find_asset_data(p)
+    if ad and ad.asset_class_path.asset_name == "StaticMesh":
+        results.append(p)
+print("RESULT::" + "|".join(results))
+'''
+            r = client.run_command(cmd, mode='exec', timeout=120)
+            client.disconnect()
+
+            out_text = ''
+            out = r.get('output', '')
+            if isinstance(out, list):
+                out_text = ''.join(str(item.get('output', '')) if isinstance(item, dict) else str(item) for item in out)
+            else:
+                out_text = str(out)
+
+            ue_meshes = set()
+            for line in out_text.splitlines():
+                line = line.strip()
+                if line.startswith('RESULT::'):
+                    paths_str = line[len('RESULT::'):]
+                    if paths_str:
+                        ue_meshes = set(p.strip() for p in paths_str.split('|') if p.strip())
+                    break
+
+            # Build mapping: for each mesh in DB, check if its import dest exists in UE
+            assets = self.db.search_static_meshes('')
+            updates = {}
+            imported_count = 0
+            for a in assets:
+                pp = a['package_path']
+                dest = ue_path_to_import_dest(pp, content_root)
+                if dest in ue_meshes:
+                    updates[pp] = 1
+                    imported_count += 1
+                else:
+                    updates[pp] = 0
+
+            self.db.batch_update_ue_imported(updates)
+            self.queue.put(('log', f"  ✓ Scanned {len(assets)} meshes, {imported_count} found in UE"))
+            self.queue.put(('ue_refresh_done', True, f"{imported_count}/{len(assets)} imported"))
+        except Exception as e:
+            self.queue.put(('log', f"  ✗ ERROR: {e}"))
+            self.queue.put(('ue_refresh_done', False, str(e)))
+
     def _refresh_tree(self):
         self._filter_tree()
 
@@ -1085,12 +1172,21 @@ class MeshImporterApp:
         if not self.db:
             return
         assets = self.db.search_static_meshes(q)
+        # Build a cache of ue_imported status
+        ue_map = self.db.get_ue_imported_map()
         for a in assets:
             exported = a.get('exported', 0)
             if glb_only and not exported:
                 continue
-            mark = '✓' if exported else '✗'
-            label = f"[{mark}] {a['name']}"
+            glb_mark = '✓' if exported else '✗'
+            ue_val = ue_map.get(a['package_path'])
+            if ue_val is None:
+                ue_mark = '?'   # not scanned
+            elif ue_val == 1:
+                ue_mark = '✓'   # imported
+            else:
+                ue_mark = '✗'   # not imported
+            label = f"[G:{glb_mark} U:{ue_mark}] {a['name']}"
             item = self.tree.insert('', 'end', text=label, values=(a['type'],))
             self.tree_map[item] = a['package_path']
 
@@ -1367,6 +1463,14 @@ class MeshImporterApp:
                     self.import_btn.config(state='normal')
                     self.resolve_btn.config(state='normal')
                     self.batch_import_btn.config(state='normal')
+                elif m[0] == 'ue_refresh_done':
+                    ok, msg = m[1], m[2]
+                    self.refresh_ue_btn.config(state='normal')
+                    if ok:
+                        self.status_var.set(f"UE import status refreshed: {msg}")
+                    else:
+                        self.status_var.set(f"UE refresh failed: {msg}")
+                    self._filter_tree()
         except queue.Empty:
             pass
         self.root.after(100, self._poll)

@@ -58,9 +58,9 @@ def fmt_size(n):
 def resolve_asset_path(json_path, ext, export_root=None):
     """Resolve the real asset file path (.glb / .png / etc.) from a JSON path.
 
-    FModel exports JSON under an ``Exports/`` sub-folder while the actual
-    binary assets (.glb, .png) sit in the parent directory.  This function
-    strips the ``Exports`` segment and swaps the extension.
+    With the unified export root (I:\\FModelOutput\\Exports), both JSON
+    metadata and binary assets (.glb, .png) live in the same directory.
+    This function simply swaps the .json extension for the target extension.
 
     Args:
         json_path: Absolute path to the .json file (or a path joined from
@@ -77,18 +77,9 @@ def resolve_asset_path(json_path, ext, export_root=None):
     if export_root and not os.path.isabs(p):
         p = os.path.join(export_root, p)
     norm = p.replace('\\', '/')
-    parts = norm.split('/')
-    candidates = []
-    if 'Exports' in parts:
-        idx = parts.index('Exports')
-        de_parts = parts[:idx] + parts[idx + 1:]
-        base = de_parts[-1].rsplit('.json', 1)[0]
-        de_parts[-1] = base + ext
-        candidates.append(os.path.normpath('/'.join(de_parts)))
-    candidates.append(os.path.normpath(norm.rsplit('.json', 1)[0] + ext))
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
+    candidate = os.path.normpath(norm.rsplit('.json', 1)[0] + ext)
+    if os.path.isfile(candidate):
+        return candidate
     return None
 
 
@@ -103,7 +94,8 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 package_path TEXT UNIQUE NOT NULL,
                 name TEXT, type TEXT, file_path TEXT, file_size INTEGER,
-                exported INTEGER DEFAULT 0
+                exported INTEGER DEFAULT 0,
+                ue_imported INTEGER DEFAULT NULL
             );
             CREATE TABLE IF NOT EXISTS refs (
                 source_id INTEGER, target_path TEXT, target_type TEXT
@@ -113,6 +105,11 @@ class Database:
         # Migration: add 'exported' column for databases created before this feature.
         try:
             self.conn.execute('ALTER TABLE assets ADD COLUMN exported INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        # Migration: add 'ue_imported' column (NULL=not scanned, 1=imported, 0=not imported)
+        try:
+            self.conn.execute('ALTER TABLE assets ADD COLUMN ue_imported INTEGER DEFAULT NULL')
         except sqlite3.OperationalError:
             pass  # Column already exists
         self.conn.commit()
@@ -231,7 +228,7 @@ class Scanner:
         except OSError:
             fsize = 0
         # Check whether the actual asset binary has been exported.
-        # For meshes, the .glb sits in a parallel directory (without 'Exports').
+        # Binary assets (.glb, .png) are in the same directory as the JSON.
         exported = 0
         if 'Mesh' in atype:
             abs_json = os.path.join(root, os.path.relpath(fpath, root))
@@ -529,7 +526,7 @@ class App:
         self.db = Database(DB_PATH)
         self.queue = queue.Queue()
         self.scanning = False
-        self.last_dir = self.db.get_meta('last_dir') or r"I:\FModelOutput\Exports\SLASHER\Content"
+        self.last_dir = self.db.get_meta('last_dir') or r"I:\FModelOutput\Exports"
         self.tree_map = {}  # tree_item_id -> package_path
         root.title("UE Asset Reference Viewer")
         root.geometry("1280x780")
@@ -951,7 +948,7 @@ class App:
                 self.preview_canvas.create_text(cw//2, ch//2, anchor='center', text='Texture PNG not found',
                                                 fill='#888', font=('Segoe UI', 8))
         elif 'Mesh' in atype:
-            # GLB is in a parallel directory without "Exports" segment
+            # GLB is in the same directory as the JSON
             glb_path = self._find_glb(full_path)
             if glb_path:
                 self._render_wireframe_glb(glb_path)
@@ -1042,8 +1039,8 @@ class App:
                                             fill='#A55', font=('Segoe UI', 8))
 
     def _find_asset_file(self, json_path, ext):
-        """Find a sibling asset file (.glb / .png) by removing the 'Exports'
-        path segment and swapping the .json extension for `ext`.
+        """Find a sibling asset file (.glb / .png) by swapping the .json
+        extension for `ext` in the same directory.
         Delegates to the module-level resolve_asset_path for reuse."""
         return resolve_asset_path(json_path, ext)
 
