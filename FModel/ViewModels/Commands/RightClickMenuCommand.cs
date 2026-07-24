@@ -67,6 +67,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
 
             "Save_Data" => (EAction.Export, EShowAssetType.None, EBulkType.Raw),
             "Save_Properties" => (EAction.Export, EShowAssetType.None, EBulkType.Properties),
+            "Save_Folder_Material" => (EAction.Export, EShowAssetType.None, EBulkType.Materials),
             "Save_Textures" => (EAction.Export, EShowAssetType.None, EBulkType.Textures),
             "Save_Models" => (EAction.Export, EShowAssetType.None, EBulkType.Meshes),
             "Save_Animations" => (EAction.Export, EShowAssetType.None, EBulkType.Animations),
@@ -114,6 +115,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
             {
                 EBulkType.Raw => (UserSettings.Default.RawDataDirectory, "files"),
                 EBulkType.Properties => (UserSettings.Default.PropertiesDirectory, "json files"),
+                EBulkType.Materials => (UserSettings.Default.PropertiesDirectory, "material json files"),
                 EBulkType.Textures => (UserSettings.Default.TextureDirectory, "textures"),
                 EBulkType.Meshes => (UserSettings.Default.ModelDirectory, "models"),
                 EBulkType.Animations => (UserSettings.Default.ModelDirectory, "animations"),
@@ -128,6 +130,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
             Action<TreeItem> folderAction = bulktype switch
             {
                 EBulkType.Raw => folder => contextViewModel.CUE4Parse.ExportFolder(cancellationToken, folder),
+                EBulkType.Materials => folder => contextViewModel.CUE4Parse.MaterialFolder(cancellationToken, folder),
                 _ => folder => contextViewModel.CUE4Parse.ExtractFolder(cancellationToken, folder, bulktype | EBulkType.Auto),
             };
 

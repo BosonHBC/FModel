@@ -112,6 +112,18 @@ PARAM_CONNECTIONS = {
         'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_COLOR',
         'connections': [],
     },
+    'VirtualMask': {
+        'role': 'virtual_mask', 'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_Masks',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_VIRTUAL_MASKS',
+        'connections': [],
+    },
+    'VirtualColor': {
+        'role': 'virtual_color', 'srgb': True,
+        'compression': 'unreal.TextureCompressionSettings.TC_Default',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_VIRTUAL_COLOR',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_BASE_COLOR')],
+    },
 }
 
 # Backward-compatible role lookup (param_name → role string)
@@ -131,6 +143,15 @@ class DBHelper:
             self.conn.execute('ALTER TABLE assets ADD COLUMN ue_imported INTEGER DEFAULT NULL')
         except sqlite3.OperationalError:
             pass  # Column already exists
+        # Migration: add 'tri_count' and 'glb_size' columns for mesh stats
+        try:
+            self.conn.execute('ALTER TABLE assets ADD COLUMN tri_count INTEGER DEFAULT NULL')
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.conn.execute('ALTER TABLE assets ADD COLUMN glb_size INTEGER DEFAULT NULL')
+        except sqlite3.OperationalError:
+            pass
 
     def get_meta(self, key):
         r = self.conn.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
@@ -139,13 +160,13 @@ class DBHelper:
     def search_static_meshes(self, query=''):
         q = f"%{query}%" if query else "%"
         return [dict(r) for r in self.conn.execute(
-            'SELECT * FROM assets WHERE type=? AND name LIKE ? ORDER BY name',
-            ('StaticMesh', q))]
+            'SELECT * FROM assets WHERE type=? AND (name LIKE ? OR package_path LIKE ?) ORDER BY name',
+            ('StaticMesh', q, q))]
 
     def search_all_assets(self, query=''):
         q = f"%{query}%" if query else "%"
         return [dict(r) for r in self.conn.execute(
-            'SELECT * FROM assets WHERE name LIKE ? ORDER BY type, name', (q,))]
+            'SELECT * FROM assets WHERE (name LIKE ? OR package_path LIKE ?) ORDER BY type, name', (q, q))]
 
     def get_by_path(self, pp):
         r = self.conn.execute('SELECT * FROM assets WHERE package_path=?', (pp,)).fetchone()
@@ -162,6 +183,17 @@ class DBHelper:
         self.conn.executemany('UPDATE assets SET ue_imported=? WHERE package_path=?',
                               [(v, k) for k, v in updates.items()])
         self.conn.commit()
+
+    def batch_update_mesh_stats(self, updates):
+        """Batch update tri_count and glb_size. updates: dict {package_path: (tri_count, glb_size)}"""
+        self.conn.executemany('UPDATE assets SET tri_count=?, glb_size=? WHERE package_path=?',
+                              [(v[0], v[1], k) for k, v in updates.items()])
+        self.conn.commit()
+
+    def get_mesh_stats_map(self):
+        """Return {package_path: (tri_count, glb_size)} for all assets."""
+        return {r['package_path']: (r['tri_count'], r['glb_size']) for r in
+                self.conn.execute('SELECT package_path, tri_count, glb_size FROM assets')}
 
     def get_ue_imported_map(self):
         """Return {package_path: ue_imported} for all assets."""
@@ -208,8 +240,19 @@ def get_fmodel_roots(fmodel_root):
     """Get all possible root directories to search for files.
     With the unified export root, both JSON metadata and binary assets
     (.glb, .png) live under the same directory tree.
+    The FModel export root may be I:\\FModelOutput\\Exports, but actual
+    assets live under I:\\FModelOutput\\Exports\\SLASHER\\Content\\.
+    The /Game/ prefix maps to the Content directory, so we need to try
+    both the root and root/SLASHER/Content as candidates.
     """
-    return [fmodel_root]
+    roots = [fmodel_root]
+    # FModel exports often have a Content subdirectory (e.g. SLASHER/Content)
+    # The /Game/ path maps to Content, so files are under root/SLASHER/Content/
+    for sub in ('SLASHER/Content', 'Content'):
+        candidate = os.path.join(fmodel_root, sub)
+        if os.path.isdir(candidate) and candidate not in roots:
+            roots.append(candidate)
+    return roots
 
 
 def ue_path_to_local(ue_path, fmodel_root):
@@ -286,7 +329,9 @@ def find_material_json(ue_path, fmodel_root, prefer_raw=False):
 def guess_texture_role(name):
     """Guess texture role from filename suffix."""
     n = name.upper()
-    for suffix, role in [('_ORM', 'orm'), ('_NORMAL', 'normal'), ('_N', 'normal'),
+    for suffix, role in [('_VIRTUALMASK', 'virtual_mask'),
+                          ('_VIRTUALCOLOR', 'virtual_color'),
+                          ('_ORM', 'orm'), ('_NORMAL', 'normal'), ('_N', 'normal'),
                           ('_DISPLACEMENT', 'mask'), ('_HEIGHT', 'mask'),
                           ('_M', 'mask'), ('_C', 'mask'),
                           ('_ALBEDO', 'diffuse'), ('_BASECOLOR', 'diffuse'),
@@ -294,6 +339,10 @@ def guess_texture_role(name):
         if n.endswith(suffix):
             return role
     # Check for common keywords
+    if 'VIRTUALMASK' in n:
+        return 'virtual_mask'
+    if 'VIRTUALCOLOR' in n:
+        return 'virtual_color'
     if 'NORMAL' in n or 'NORM' in n:
         return 'normal'
     if 'ORM' in n or 'ROUGH' in n:
@@ -359,6 +408,10 @@ def get_param_connection(param_name, master_conn_map=None):
         return conn
     # Fallback: try to infer from param name
     pn = param_name.lower()
+    if 'virtualmask' in pn:
+        return PARAM_CONNECTIONS['VirtualMask']
+    if 'virtualcolor' in pn:
+        return PARAM_CONNECTIONS['VirtualColor']
     if 'albedo' in pn or 'diffuse' in pn or 'base' in pn or 'color' in pn:
         return PARAM_CONNECTIONS['Base_Albedo']
     if 'normal' in pn or 'norm' in pn:
@@ -410,7 +463,11 @@ def build_param_connections_from_master(master_json_data):
         # If suffix-based detection is inconclusive, use param name semantics
         if not role or role == 'diffuse':
             pn = pname.lower()
-            if 'normal' in pn:
+            if 'virtualmask' in pn:
+                role = 'virtual_mask'
+            elif 'virtualcolor' in pn:
+                role = 'virtual_color'
+            elif 'normal' in pn:
                 role = 'normal'
             elif 'orm' in pn or 'roughness' in pn or 'specular' in pn:
                 role = 'orm'
@@ -482,8 +539,8 @@ class RefResolver:
 
         # Find GLB file
         json_path, glb_path = ue_path_to_local(mesh_path, self.fmodel_root)
-        result['json_file'] = json_path if os.path.isfile(json_path) else None
-        result['glb_file'] = glb_path if os.path.isfile(glb_path) else None
+        result['json_file'] = json_path if (json_path and os.path.isfile(json_path)) else None
+        result['glb_file'] = glb_path if (glb_path and os.path.isfile(glb_path)) else None
         if not result['glb_file']:
             result['missing'].append({'ue_path': mesh_path, 'type': 'StaticMesh', 'reason': 'GLB file not found'})
 
@@ -504,7 +561,9 @@ class RefResolver:
                 if isinstance(e, dict) and e.get('Type') == 'StaticMesh':
                     sms = e.get('Properties', {}).get('StaticMaterials', [])
                     for sm in sms:
-                        mi = sm.get('MaterialInterface', {})
+                        mi = sm.get('MaterialInterface')
+                        if not mi or not isinstance(mi, dict):
+                            continue
                         obj_name = mi.get('ObjectName', '')
                         obj_path = mi.get('ObjectPath', '')
                         if obj_path:
@@ -572,6 +631,7 @@ class RefResolver:
                     # Support two formats:
                     # 1. Simplified: { "Textures": { "param": "/Game/path.Asset" } }
                     # 2. FModel raw: [ { "Properties": { "TextureParameterValues": [...] } } ]
+                    # 3. Master Material fallback: ReferencedTextures (no param names)
                     textures = {}
                     if isinstance(mat_data, dict) and 'Textures' in mat_data:
                         textures = mat_data['Textures']
@@ -585,16 +645,38 @@ class RefResolver:
                                         param_name = param_info.get('Name', '') if isinstance(param_info, dict) else ''
                                         val = tp.get('ParameterValue', {})
                                         if isinstance(val, dict):
-                                            tex_path = val.get('ObjectName', '') or val.get('ObjectPath', '')
-                                            # ObjectName is like "Texture2D'T_Atlass_A_C'"
                                             # ObjectPath is like "/Game/.../T_Atlass_A_C.T_Atlass_A_C"
+                                            # ObjectName is like "Texture2D'T_Atlass_A_C'" (no path)
+                                            # Prefer ObjectPath since it always has the full /Game/ path
+                                            tex_path = val.get('ObjectPath', '') or val.get('ObjectName', '')
                                             if tex_path and tex_path.startswith('/Game/'):
                                                 tex_path = norm_path(tex_path)
                                             elif tex_path and "'" in tex_path:
-                                                # Extract from "Texture2D'T_Atlass_A_C'" - need to find actual path
+                                                # Extract from "Texture2D'T_Atlass_A_C'" format
+                                                # Fallback: no /Game/ path available, skip
                                                 pass
                                             if param_name and tex_path and tex_path.startswith('/Game/'):
                                                 textures[param_name] = tex_path
+                                # If no TextureParameterValues textures found, try ReferencedTextures
+                                # (Master Materials store texture refs at top level and/or in
+                                # CachedExpressionData, NOT in Properties.ReferencedTextures)
+                                if not textures:
+                                    ref_texs = []
+                                    # Top-level ReferencedTextures
+                                    ref_texs.extend(e.get('ReferencedTextures', []))
+                                    # CachedExpressionData.ReferencedTextures
+                                    ced = e.get('CachedExpressionData', {})
+                                    if isinstance(ced, dict):
+                                        ref_texs.extend(ced.get('ReferencedTextures', []))
+                                    for rt in ref_texs:
+                                        if isinstance(rt, dict):
+                                            tex_path = rt.get('ObjectPath', '')
+                                            if tex_path and tex_path.startswith('/Game/'):
+                                                tex_norm = norm_path(tex_path)
+                                                tex_name = os.path.basename(tex_norm)
+                                                role = guess_texture_role(tex_name)
+                                                if role:
+                                                    textures[role] = tex_norm
                                 break
                     
                     # Resolve Master Material to build deterministic param connection map
@@ -619,7 +701,11 @@ class RefResolver:
                         # param names that exist in it. This excludes junk keys like
                         # texture filenames (T_Tiles_A_Bake_02_M) and legacy aliases
                         # (PM_Diffuse) that don't match the master material's actual params.
-                        if valid_param_names is not None and param_name not in valid_param_names:
+                        # Exception: role-based keys (diffuse, normal, orm, mask) from
+                        # ReferencedTextures are always accepted since they represent
+                        # standard PBR texture slots.
+                        is_role_key = param_name in ('diffuse', 'normal', 'orm', 'mask')
+                        if valid_param_names is not None and param_name not in valid_param_names and not is_role_key:
                             continue
                         # Deduplicate: skip if this texture was already assigned via another param
                         if tex_norm in seen_tex_in_section:
@@ -649,11 +735,26 @@ class RefResolver:
                 except Exception:
                     pass
             else:
-                result['missing'].append({
-                    'ue_path': mat_path,
-                    'type': sm['material_type'],
-                    'reason': 'Material JSON not found'
-                })
+                # Engine built-in materials (e.g. WorldGridMaterial) don't have JSON files
+                # but exist in UE natively — mark as found, don't add to missing
+                if mat_path.startswith('/Engine/') or mat_path.startswith('/Script/'):
+                    section['found'] = True
+                    section['material_type'] = sm['material_type'] + ' (Engine)'
+                    if mat_path not in seen_materials:
+                        mat_info = {
+                            'ue_path': mat_path,
+                            'type': sm['material_type'] + ' (Engine)',
+                            'json_file': None,
+                            'name': os.path.basename(mat_path),
+                        }
+                        result['all_materials'].append(mat_info)
+                        seen_materials[mat_path] = mat_info
+                else:
+                    result['missing'].append({
+                        'ue_path': mat_path,
+                        'type': sm['material_type'],
+                        'reason': 'Material JSON not found'
+                    })
 
             result['sections'].append(section)
 
@@ -946,6 +1047,16 @@ class MeshImporterApp:
         self.ue_port = 6766
         self.current_resolution = None
         self.tree_map = {}
+        # Wireframe preview state
+        self._preview_mode = None
+        self._mesh_verts = None
+        self._mesh_edges = None
+        self._mesh_meta = None
+        self._mesh_rot_x = 0.0
+        self._mesh_rot_y = 0.0
+        self._mesh_zoom = 1.0
+        self._preview_token = None
+        self._drag_last = None
 
         root.title("UE Static Mesh Importer")
         root.geometry("1400x860")
@@ -980,14 +1091,12 @@ class MeshImporterApp:
 
         top.columnconfigure(1, weight=1)
 
-        # Main area: left tree, center details, right log
-        main = ttk.Frame(self.root)
-        main.pack(fill='both', expand=True, padx=8, pady=4)
+        # Main area: PanedWindow for resizable panels
+        paned = ttk.PanedWindow(self.root, orient='horizontal')
+        paned.pack(fill='both', expand=True, padx=8, pady=4)
 
         # Left: asset search + tree
-        left = ttk.Frame(main, width=320)
-        left.pack(side='left', fill='y')
-        left.pack_propagate(False)
+        left = ttk.Frame(paned)
 
         ttk.Label(left, text="Search StaticMesh:").pack(anchor='w')
         self.search_var = tk.StringVar()
@@ -997,16 +1106,30 @@ class MeshImporterApp:
         self.glb_only_var.trace_add('write', lambda *_: self._filter_tree())
         ttk.Checkbutton(left, text="Only show meshes with GLB",
                         variable=self.glb_only_var).pack(anchor='w', pady=(0, 4))
+        self.not_imported_var = tk.BooleanVar(value=False)
+        self.not_imported_var.trace_add('write', lambda *_: self._filter_tree())
+        ttk.Checkbutton(left, text="Only show not imported to UE",
+                        variable=self.not_imported_var).pack(anchor='w', pady=(0, 4))
         self.refresh_ue_btn = ttk.Button(left, text="Refresh UE Import Status",
                                          command=self._refresh_ue_import_status)
         self.refresh_ue_btn.pack(fill='x', pady=(0, 4))
+        # Mesh stats (tri_count, glb_size) are now populated during database build in ref_viewer.py
+        # No separate scan button needed - data is read directly from the database.
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill='both', expand=True)
-        self.tree = ttk.Treeview(tree_frame, columns=('type',), show='tree headings', selectmode='extended')
+        self.tree = ttk.Treeview(tree_frame, columns=('type', 'glb', 'ue', 'tris', 'size'), show='tree headings', selectmode='extended')
         self.tree.heading('#0', text='Asset')
         self.tree.heading('type', text='Type')
+        self.tree.heading('glb', text='GLB')
+        self.tree.heading('ue', text='UE')
+        self.tree.heading('tris', text='Tris')
+        self.tree.heading('size', text='Size')
         self.tree.column('#0', width=200)
         self.tree.column('type', width=70)
+        self.tree.column('glb', width=50, anchor='center')
+        self.tree.column('ue', width=50, anchor='center')
+        self.tree.column('tris', width=60, anchor='e')
+        self.tree.column('size', width=70, anchor='e')
         vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side='left', fill='both', expand=True)
@@ -1014,13 +1137,20 @@ class MeshImporterApp:
         self.tree.bind('<<TreeviewSelect>>', self._on_tree_select)
         self.tree.bind('<Double-1>', self._on_tree_dblclick)
         self.tree.bind('<Button-3>', self._tree_right_click)
+        paned.add(left, weight=1)
 
-        # Center: reference details
-        center = ttk.Frame(main)
-        center.pack(side='left', fill='both', expand=True, padx=4)
+        # Center: Notebook with Details and Preview tabs
+        center = ttk.Frame(paned)
+        paned.add(center, weight=2)
 
-        ttk.Label(center, text="Reference Details", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
-        detail_frame = ttk.Frame(center)
+        self.center_nb = ttk.Notebook(center)
+        self.center_nb.pack(fill='both', expand=True)
+
+        # --- Tab 1: Reference Details ---
+        details_tab = ttk.Frame(self.center_nb)
+        self.center_nb.add(details_tab, text="Details")
+
+        detail_frame = ttk.Frame(details_tab)
         detail_frame.pack(fill='both', expand=True)
 
         self.detail_text = tk.Text(detail_frame, wrap='word', state='disabled',
@@ -1032,7 +1162,7 @@ class MeshImporterApp:
         dsb.pack(side='right', fill='y')
 
         # Buttons
-        btn_frame = ttk.Frame(center)
+        btn_frame = ttk.Frame(details_tab)
         btn_frame.pack(fill='x', pady=4)
         self.resolve_btn = ttk.Button(btn_frame, text="Resolve References", command=self._resolve_selected)
         self.resolve_btn.pack(side='left', padx=4)
@@ -1040,11 +1170,26 @@ class MeshImporterApp:
         self.import_btn.pack(side='left', padx=4)
         self.batch_import_btn = ttk.Button(btn_frame, text="Batch Import to UE", command=self._start_batch_import, state='normal')
         self.batch_import_btn.pack(side='left', padx=4)
+        self.skip_glb_var = tk.BooleanVar(value=True)
+        self.skip_glb_cb = ttk.Checkbutton(btn_frame, text="Skip existing GLB", variable=self.skip_glb_var)
+        self.skip_glb_cb.pack(side='left', padx=4)
+
+        # --- Tab 2: Wireframe Preview ---
+        preview_tab = ttk.Frame(self.center_nb)
+        self.center_nb.add(preview_tab, text="Preview")
+
+        self.preview_canvas = tk.Canvas(preview_tab, bg='#2B2B2B', highlightthickness=0)
+        self.preview_canvas.pack(fill='both', expand=True)
+        self.preview_canvas.bind('<ButtonPress-1>', self._preview_drag_start)
+        self.preview_canvas.bind('<B1-Motion>', self._preview_drag_move)
+        self.preview_canvas.bind('<ButtonRelease-1>', self._preview_drag_end)
+        self.preview_canvas.bind('<MouseWheel>', self._preview_wheel)
+        self.preview_canvas.bind('<Button-4>', self._preview_wheel)
+        self.preview_canvas.bind('<Button-5>', self._preview_wheel)
+        self.preview_canvas.bind('<Double-Button-1>', self._preview_reset_view)
 
         # Right: log
-        right = ttk.Frame(main, width=400)
-        right.pack(side='right', fill='y')
-        right.pack_propagate(False)
+        right = ttk.Frame(paned)
 
         ttk.Label(right, text="Import Log", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
         log_frame = ttk.Frame(right)
@@ -1058,6 +1203,7 @@ class MeshImporterApp:
         self.log_text.pack(side='left', fill='both', expand=True)
         lsb.pack(side='right', fill='y')
         self.log_text.bind('<Button-3>', self._log_right_click)
+        paned.add(right, weight=1)
 
         # Progress bar
         self.pb = ttk.Progressbar(self.root, mode='determinate')
@@ -1138,7 +1284,13 @@ print("RESULT::" + "|".join(results))
                 if line.startswith('RESULT::'):
                     paths_str = line[len('RESULT::'):]
                     if paths_str:
-                        ue_meshes = set(p.strip() for p in paths_str.split('|') if p.strip())
+                        for p in paths_str.split('|'):
+                            p = p.strip()
+                            if p:
+                                # UE returns object paths like /Game/.../SM_xxx.SM_xxx
+                                # Convert to package path by stripping the .ObjectName suffix
+                                pkg = p.rsplit('.', 1)[0] if '.' in p else p
+                                ue_meshes.add(pkg)
                     break
 
             # Build mapping: for each mesh in DB, check if its import dest exists in UE
@@ -1148,7 +1300,9 @@ print("RESULT::" + "|".join(results))
             for a in assets:
                 pp = a['package_path']
                 dest = ue_path_to_import_dest(pp, content_root)
-                if dest in ue_meshes:
+                # Also try matching with .ObjectName suffix stripped from dest for safety
+                dest_pkg = dest.rsplit('.', 1)[0] if '.' in dest else dest
+                if dest in ue_meshes or dest_pkg in ue_meshes:
                     updates[pp] = 1
                     imported_count += 1
                 else:
@@ -1167,6 +1321,7 @@ print("RESULT::" + "|".join(results))
     def _filter_tree(self):
         q = self.search_var.get()
         glb_only = getattr(self, 'glb_only_var', None) and self.glb_only_var.get()
+        not_imported = getattr(self, 'not_imported_var', None) and self.not_imported_var.get()
         self.tree.delete(*self.tree.get_children())
         self.tree_map.clear()
         if not self.db:
@@ -1174,21 +1329,53 @@ print("RESULT::" + "|".join(results))
         assets = self.db.search_static_meshes(q)
         # Build a cache of ue_imported status
         ue_map = self.db.get_ue_imported_map()
+        # Build a cache of mesh stats (tri_count, glb_size)
+        stats_map = self.db.get_mesh_stats_map()
         for a in assets:
             exported = a.get('exported', 0)
             if glb_only and not exported:
                 continue
+            ue_val = ue_map.get(a['package_path'])
+            if not_imported and ue_val == 1:
+                continue
             glb_mark = '✓' if exported else '✗'
             ue_val = ue_map.get(a['package_path'])
             if ue_val is None:
-                ue_mark = '?'   # not scanned
+                ue_mark = '?'
             elif ue_val == 1:
-                ue_mark = '✓'   # imported
+                ue_mark = '✓'
             else:
-                ue_mark = '✗'   # not imported
-            label = f"[G:{glb_mark} U:{ue_mark}] {a['name']}"
-            item = self.tree.insert('', 'end', text=label, values=(a['type'],))
+                ue_mark = '✗'
+            tris_val, size_val = stats_map.get(a['package_path'], (None, None))
+            tris_str = self._fmt_tris(tris_val)
+            size_str = self._fmt_size(size_val)
+            item = self.tree.insert('', 'end', text=a['name'],
+                                    values=(a['type'], glb_mark, ue_mark, tris_str, size_str))
             self.tree_map[item] = a['package_path']
+
+    @staticmethod
+    def _fmt_tris(n):
+        """Format triangle count: 1300000 -> '1.3M', 248000 -> '248K', 500 -> '500'."""
+        if n is None:
+            return '-'
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        elif n >= 1_000:
+            return f"{n // 1_000}K"
+        return str(n)
+
+    @staticmethod
+    def _fmt_size(n):
+        """Format file size in bytes to human-readable: 1048576 -> '1.0MB'."""
+        if n is None:
+            return '-'
+        if n >= 1_073_741_824:
+            return f"{n / 1_073_741_824:.1f}GB"
+        elif n >= 1_048_576:
+            return f"{n / 1_048_576:.1f}MB"
+        elif n >= 1024:
+            return f"{n / 1024:.0f}KB"
+        return f"{n}B"
 
     def _on_tree_select(self, e):
         sel = self.tree.selection()
@@ -1197,6 +1384,7 @@ print("RESULT::" + "|".join(results))
         pp = self.tree_map.get(sel[0])
         if pp:
             self._show_asset_info(pp)
+            self._update_wireframe(pp)
 
     def _on_tree_dblclick(self, e):
         self._resolve_selected()
@@ -1241,6 +1429,284 @@ print("RESULT::" + "|".join(results))
         self._detail_append(f"Path:   {asset['package_path']}\n")
         self._detail_append(f"File:   {asset['file_path']}\n")
         self._detail_append(f"\n--- Click 'Resolve References' to analyze dependencies ---\n")
+
+    # ======================== Wireframe Preview ========================
+
+    def _update_wireframe(self, mesh_path):
+        """Update wireframe preview when a StaticMesh is selected."""
+        self.preview_canvas.delete('all')
+        self._preview_mode = None
+        self._preview_token = None
+        cw = max(self.preview_canvas.winfo_width(), 280)
+        ch = max(self.preview_canvas.winfo_height(), 200)
+
+        json_path, glb_path = ue_path_to_local(mesh_path, self.fmodel_var.get())
+        if glb_path and os.path.isfile(glb_path):
+            self._render_wireframe_glb(glb_path)
+        elif json_path and os.path.isfile(json_path):
+            self._render_wireframe(json_path)
+        else:
+            self.preview_canvas.create_text(cw // 2, ch // 2, anchor='center',
+                                            text='No mesh file found', fill='#888',
+                                            font=('Segoe UI', 9))
+
+    def _render_wireframe(self, json_path):
+        """Parse vertex/index data from a StaticMesh JSON and draw wireframe."""
+        try:
+            with open(json_path, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+            entries = data if isinstance(data, list) else [data]
+            verts, indices = [], []
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                props = e.get('Properties') or {}
+                agg = props.get('AggGeom') or {}
+                for ce in agg.get('ConvexElems', []):
+                    vd = ce.get('VertexData', [])
+                    base = len(verts)
+                    for v in vd:
+                        verts.append((v['X'], v['Y'], v['Z']))
+                    idata = ce.get('IndexData', [])
+                    for i in range(0, len(idata), 3):
+                        if i + 2 < len(idata):
+                            indices.append((idata[i] + base, idata[i + 1] + base, idata[i + 2] + base))
+            if not verts:
+                cw = max(self.preview_canvas.winfo_width(), 280)
+                ch = max(self.preview_canvas.winfo_height(), 200)
+                self.preview_canvas.create_text(cw // 2, ch // 2, anchor='center',
+                                                text='No vertex data', fill='#888',
+                                                font=('Segoe UI', 8))
+                return
+            self._draw_wireframe(verts, indices)
+        except Exception as e:
+            cw = max(self.preview_canvas.winfo_width(), 280)
+            ch = max(self.preview_canvas.winfo_height(), 200)
+            self.preview_canvas.create_text(cw // 2, ch // 2, anchor='center',
+                                            text=f'Error: {e}', fill='#A55',
+                                            font=('Segoe UI', 8))
+
+    def _render_wireframe_glb(self, glb_path):
+        """Parse a GLB in a background thread, then draw wireframe on the main thread."""
+        cw = max(self.preview_canvas.winfo_width(), 280)
+        ch = max(self.preview_canvas.winfo_height(), 200)
+        self.preview_canvas.create_text(cw // 2, ch // 2, anchor='center',
+                                        text='Loading mesh...', fill='#888',
+                                        font=('Segoe UI', 9))
+        token = object()
+        self._preview_token = token
+
+        def worker():
+            try:
+                result = self._parse_glb(glb_path)
+                err = None
+            except Exception as e:
+                result, err = None, str(e)
+
+            def apply():
+                if getattr(self, '_preview_token', None) is not token:
+                    return
+                self.preview_canvas.delete('all')
+                if err:
+                    self.preview_canvas.create_text(cw // 2, ch // 2, anchor='center',
+                                                    text=f'Error: {err}', fill='#A55',
+                                                    font=('Segoe UI', 8))
+                elif not result or not result[0]:
+                    self.preview_canvas.create_text(cw // 2, ch // 2, anchor='center',
+                                                    text='No vertex data in GLB', fill='#888',
+                                                    font=('Segoe UI', 8))
+                else:
+                    verts, indices, total_tris = result
+                    self._draw_wireframe(verts, indices, total_tris)
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _parse_glb(glb_path):
+        """Parse GLB geometry for wireframe preview. Returns (verts, indices, total_tris)."""
+        import struct
+        from pygltflib import GLTF2
+        MAX_TRIS = 20000
+        gltf = GLTF2().load(glb_path)
+        blob = gltf.binary_blob()
+        if not blob:
+            return ([], [], 0)
+
+        prims = []
+        total_tris = 0
+        for mesh in gltf.meshes:
+            for prim in mesh.primitives:
+                if prim.mode not in (None, 4):
+                    continue
+                if prim.attributes.POSITION is None:
+                    continue
+                pos_acc = gltf.accessors[prim.attributes.POSITION]
+                bv = gltf.bufferViews[pos_acc.bufferView]
+                pstart = (bv.byteOffset or 0) + (pos_acc.byteOffset or 0)
+                pstride = bv.byteStride or 12
+                pcount = pos_acc.count
+                entry = {'pstart': pstart, 'pstride': pstride, 'pcount': pcount}
+                if prim.indices is not None:
+                    idx_acc = gltf.accessors[prim.indices]
+                    ibv = gltf.bufferViews[idx_acc.bufferView]
+                    istart = (ibv.byteOffset or 0) + (idx_acc.byteOffset or 0)
+                    fmt, sz = {5121: ('<B', 1), 5123: ('<H', 2), 5125: ('<I', 4)}.get(
+                        idx_acc.componentType, ('<I', 4))
+                    entry.update({'indexed': True, 'istart': istart, 'fmt': fmt, 'sz': sz,
+                                  'tri_count': idx_acc.count // 3})
+                else:
+                    entry.update({'indexed': False, 'tri_count': pcount // 3})
+                prims.append(entry)
+                total_tris += entry['tri_count']
+
+        if total_tris == 0:
+            return ([], [], 0)
+
+        step = max(1, total_tris // MAX_TRIS)
+        verts, indices = [], []
+        vert_cache = {}
+
+        def get_vert(pstart, pstride, local_vi):
+            key = (pstart, local_vi)
+            cached = vert_cache.get(key)
+            if cached is not None:
+                return cached
+            off = pstart + local_vi * pstride
+            x, y, z = struct.unpack_from('<fff', blob, off)
+            idx = len(verts)
+            verts.append((x, y, z))
+            vert_cache[key] = idx
+            return idx
+
+        for prim in prims:
+            pstart, pstride, pcount = prim['pstart'], prim['pstride'], prim['pcount']
+            if prim['indexed']:
+                istart, fmt, sz = prim['istart'], prim['fmt'], prim['sz']
+                for t in range(0, prim['tri_count'], step):
+                    k = t * 3
+                    a = struct.unpack_from(fmt, blob, istart + k * sz)[0]
+                    b = struct.unpack_from(fmt, blob, istart + (k + 1) * sz)[0]
+                    c = struct.unpack_from(fmt, blob, istart + (k + 2) * sz)[0]
+                    if a < pcount and b < pcount and c < pcount:
+                        indices.append((get_vert(pstart, pstride, a),
+                                        get_vert(pstart, pstride, b),
+                                        get_vert(pstart, pstride, c)))
+            else:
+                for t in range(0, prim['tri_count'], step):
+                    base = t * 3
+                    if base + 2 < pcount:
+                        indices.append((get_vert(pstart, pstride, base),
+                                        get_vert(pstart, pstride, base + 1),
+                                        get_vert(pstart, pstride, base + 2)))
+
+        return (verts, indices, total_tris)
+
+    def _draw_wireframe(self, verts, indices, total_tris=None):
+        """Prepare wireframe geometry, cache it, and draw with the current view."""
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        zs = [v[2] for v in verts]
+        cx = (min(xs) + max(xs)) / 2
+        cy = (min(ys) + max(ys)) / 2
+        cz = (min(zs) + max(zs)) / 2
+        centered = [(v[0] - cx, v[1] - cy, v[2] - cz) for v in verts]
+
+        drawn_tris = len(indices)
+        orig_tris = total_tris if total_tris is not None else drawn_tris
+        n = len(centered)
+        seen = set()
+        edges = []
+        for a, b, c in indices:
+            if a >= n or b >= n or c >= n:
+                continue
+            for u, v in ((a, b), (b, c), (c, a)):
+                e = (u, v) if u < v else (v, u)
+                if e not in seen:
+                    seen.add(e)
+                    edges.append(e)
+
+        ext = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) or 1.0
+        self._preview_mode = 'mesh'
+        self._mesh_verts = centered
+        self._mesh_edges = edges
+        self._mesh_meta = (ext, orig_tris, drawn_tris)
+        self._mesh_rot_x = -25.0
+        self._mesh_rot_y = 30.0
+        self._mesh_zoom = 1.0
+        self._redraw_mesh()
+
+    def _redraw_mesh(self):
+        """Project cached mesh verts with current rotation/zoom and draw edges."""
+        import math
+        if not self._mesh_verts or not self._mesh_edges:
+            return
+        ext, orig_tris, shown = self._mesh_meta
+        self.preview_canvas.delete('all')
+        self.preview_canvas.update_idletasks()
+        cw = max(self.preview_canvas.winfo_width(), 100)
+        ch = max(self.preview_canvas.winfo_height(), 100)
+        ay = math.radians(self._mesh_rot_y)
+        ax = math.radians(self._mesh_rot_x)
+        cosa, sina = math.cos(ay), math.sin(ay)
+        cosx, sinx = math.cos(ax), math.sin(ax)
+        proj = []
+        for vx, vy, vz in self._mesh_verts:
+            x1 = vx * cosa - vy * sina
+            y1 = vx * sina + vy * cosa
+            z1 = vz
+            x2 = x1
+            y2 = y1 * cosx - z1 * sinx
+            proj.append((x2, y2))
+        base_scale = min(cw, ch) * 0.76 / ext
+        scale = base_scale * self._mesh_zoom
+        ox, oy = cw / 2, ch / 2
+        pts = [(ox + x * scale, oy - y * scale) for x, y in proj]
+        for u, v in self._mesh_edges:
+            x1, y1 = pts[u]
+            x2, y2 = pts[v]
+            self.preview_canvas.create_line(x1, y1, x2, y2, fill='#4A90D9', width=1)
+        note = f"{orig_tris:,} tris"
+        if orig_tris > shown:
+            note += f" (~{shown:,} shown)"
+        self.preview_canvas.create_text(6, ch - 6, anchor='sw', text=note,
+                                        fill='#777', font=('Segoe UI', 7))
+        self.preview_canvas.create_text(6, 6, anchor='nw',
+                                        text='drag: rotate  |  wheel: zoom  |  dbl-click: reset',
+                                        fill='#555', font=('Segoe UI', 7))
+
+    def _preview_drag_start(self, e):
+        self._drag_last = (e.x, e.y)
+
+    def _preview_drag_move(self, e):
+        if self._drag_last is None or self._preview_mode != 'mesh':
+            return
+        dx = e.x - self._drag_last[0]
+        dy = e.y - self._drag_last[1]
+        self._drag_last = (e.x, e.y)
+        self._mesh_rot_y += dx * 0.5
+        self._mesh_rot_x += dy * 0.5
+        self._mesh_rot_x = max(-89.0, min(89.0, self._mesh_rot_x))
+        self._redraw_mesh()
+
+    def _preview_drag_end(self, e):
+        self._drag_last = None
+
+    def _preview_wheel(self, e):
+        if getattr(e, 'num', None) == 5 or getattr(e, 'delta', 0) < 0:
+            factor = 1 / 1.15
+        else:
+            factor = 1.15
+        if self._preview_mode == 'mesh':
+            self._mesh_zoom = max(0.1, min(30.0, self._mesh_zoom * factor))
+            self._redraw_mesh()
+
+    def _preview_reset_view(self, e):
+        if self._preview_mode == 'mesh':
+            self._mesh_rot_x = -25.0
+            self._mesh_rot_y = 30.0
+            self._mesh_zoom = 1.0
+            self._redraw_mesh()
 
     def _resolve_selected(self):
         sel = self.tree.selection()
@@ -1340,6 +1806,7 @@ print("RESULT::" + "|".join(results))
                 content_root=self.content_root,
                 ue_host=self.ue_host,
                 ue_port=self.ue_port,
+                skip_existing_glb=self.skip_glb_var.get(),
             )
             pipeline.log = lambda msg: self.queue.put(('log', msg))
             ok = pipeline.run(json_path)
@@ -1396,6 +1863,7 @@ print("RESULT::" + "|".join(results))
         total = len(mesh_paths)
         success_count = 0
         fail_count = 0
+        failed_meshes = []  # (mesh_path, error_reason)
 
         for idx, mp in enumerate(mesh_paths):
             mesh_name = os.path.basename(mp)
@@ -1407,6 +1875,7 @@ print("RESULT::" + "|".join(results))
             if not json_path:
                 self.queue.put(('log', f"  ✗ JSON not found for {mp}"))
                 fail_count += 1
+                failed_meshes.append((mp, "JSON not found"))
                 continue
             if not glb_path:
                 self.queue.put(('log', f"  ⚠ GLB not found, will attempt import anyway"))
@@ -1420,6 +1889,7 @@ print("RESULT::" + "|".join(results))
                     content_root=self.content_root,
                     ue_host=self.ue_host,
                     ue_port=self.ue_port,
+                    skip_existing_glb=self.skip_glb_var.get(),
                 )
                 # Override pipeline's log method to feed into UI via queue (thread-safe)
                 pipeline.log = lambda msg: self.queue.put(('log', msg))
@@ -1429,10 +1899,33 @@ print("RESULT::" + "|".join(results))
                     self.queue.put(('log', f"  ✓ {mesh_name} imported successfully"))
                 else:
                     fail_count += 1
+                    failed_meshes.append((mp, "pipeline.run() returned False"))
                     self.queue.put(('log', f"  ✗ {mesh_name} import failed"))
             except Exception as e:
                 fail_count += 1
+                failed_meshes.append((mp, str(e)))
                 self.queue.put(('log', f"  ✗ ERROR: {e}"))
+
+        # Write error log if there were failures
+        if failed_meshes:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_dir = os.path.join(SCRIPT_DIR, "import_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"import_errors_{timestamp}.log")
+            try:
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write(f"Batch Import Error Log\n")
+                    f.write(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Total: {total}  Success: {success_count}  Failed: {fail_count}\n")
+                    f.write(f"{'='*60}\n\n")
+                    for mesh_path, reason in failed_meshes:
+                        f.write(f"Mesh: {os.path.basename(mesh_path)}\n")
+                        f.write(f"  Path:   {mesh_path}\n")
+                        f.write(f"  Reason: {reason}\n\n")
+                self.queue.put(('log', f"\n  Error log saved to: {log_file}"))
+            except Exception as e:
+                self.queue.put(('log', f"\n  ⚠ Failed to write error log: {e}"))
 
         self.queue.put(('log', f"\n{'='*60}"))
         self.queue.put(('log', f"Batch Import Complete: {success_count} succeeded, {fail_count} failed (of {total})"))

@@ -1046,6 +1046,42 @@ public class CUE4ParseViewModel : ViewModel
     public void CodeFolder(CancellationToken cancellationToken, TreeItem folder)
         => BulkFolder(cancellationToken, folder, asset => ExtractBulk(cancellationToken, asset, EBulkType.Code | EBulkType.Auto));
 
+    /// <summary>
+    /// "Save Folder's Material" — recursively export the FULL properties JSON of every material
+    /// (UMaterial / UMaterialInstanceConstant / MI) in the folder, byte-for-byte identical to the
+    /// single-asset "Save Properties" (GetDisplayData(true)). For material instances, the referenced
+    /// parent chain up to the Master Material is also exported, even if it lives in another folder.
+    /// </summary>
+    public void MaterialFolder(CancellationToken cancellationToken, TreeItem folder)
+    {
+        ExportedMaterialJsonKeys.Clear();
+        BulkFolder(cancellationToken, folder, asset => ExtractMaterialBulk(cancellationToken, asset));
+    }
+
+    private void ExtractMaterialBulk(CancellationToken cancellationToken, GameFile entry)
+    {
+        if (entry.Extension is not ("uasset" or "umap"))
+            return;
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        IPackage package;
+        try { package = Provider.LoadPackage(entry); }
+        catch (Exception ex) { Log.Warning(ex, "Failed to load package '{Path}' for material export", entry.Path); return; }
+
+        for (var i = 0; i < package.ExportMapLength; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            UObject? obj;
+            try { obj = package.GetExport(i); }
+            catch { continue; }
+
+            // Only materials — skip meshes, textures and anything else in the folder.
+            if (obj is UMaterialInterface material)
+                SaveMaterialChainJson(material);
+        }
+    }
+
     public void Extract(CancellationToken cancellationToken, GameFile entry, bool addNewTab = false, EBulkType bulk = EBulkType.None)
     {
         ApplicationService.ApplicationView.IsAssetsExplorerVisible = false;

@@ -95,10 +95,12 @@ class Database:
                 package_path TEXT UNIQUE NOT NULL,
                 name TEXT, type TEXT, file_path TEXT, file_size INTEGER,
                 exported INTEGER DEFAULT 0,
-                ue_imported INTEGER DEFAULT NULL
+                ue_imported INTEGER DEFAULT NULL,
+                tri_count INTEGER DEFAULT NULL,
+                glb_size INTEGER DEFAULT NULL
             );
             CREATE TABLE IF NOT EXISTS refs (
-                source_id INTEGER, target_path TEXT, target_type TEXT
+                source_id INTEGER, target_path, target_type TEXT
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
         ''')
@@ -112,16 +114,25 @@ class Database:
             self.conn.execute('ALTER TABLE assets ADD COLUMN ue_imported INTEGER DEFAULT NULL')
         except sqlite3.OperationalError:
             pass  # Column already exists
+        # Migration: add 'tri_count' and 'glb_size' columns for mesh stats
+        try:
+            self.conn.execute('ALTER TABLE assets ADD COLUMN tri_count INTEGER DEFAULT NULL')
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.conn.execute('ALTER TABLE assets ADD COLUMN glb_size INTEGER DEFAULT NULL')
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     def clear(self):
         self.conn.executescript('DELETE FROM assets; DELETE FROM refs; DELETE FROM meta;')
         self.conn.commit()
 
-    def add_asset(self, pp, name, atype, fpath, fsize, exported=0):
+    def add_asset(self, pp, name, atype, fpath, fsize, exported=0, tri_count=None, glb_size=None):
         self.conn.execute(
-            'INSERT OR REPLACE INTO assets (package_path,name,type,file_path,file_size,exported) VALUES (?,?,?,?,?,?)',
-            (pp, name, atype, fpath, fsize, exported))
+            'INSERT OR REPLACE INTO assets (package_path,name,type,file_path,file_size,exported,tri_count,glb_size) VALUES (?,?,?,?,?,?,?,?)',
+            (pp, name, atype, fpath, fsize, exported, tri_count, glb_size))
         r = self.conn.execute('SELECT id FROM assets WHERE package_path=?', (pp,)).fetchone()
         return r[0]
 
@@ -230,10 +241,20 @@ class Scanner:
         # Check whether the actual asset binary has been exported.
         # Binary assets (.glb, .png) are in the same directory as the JSON.
         exported = 0
+        tri_count = None
+        glb_size = None
         if 'Mesh' in atype:
             abs_json = os.path.join(root, os.path.relpath(fpath, root))
-            if resolve_asset_path(abs_json, '.glb'):
+            glb_path = resolve_asset_path(abs_json, '.glb')
+            if glb_path:
                 exported = 1
+                try:
+                    glb_size = os.path.getsize(glb_path)
+                except OSError:
+                    pass
+                tri_count = Scanner.count_glb_tris_fast(glb_path)
+                if tri_count is None:
+                    tri_count = Scanner.count_json_tris(fpath)
         elif 'Texture' in atype:
             abs_json = os.path.join(root, os.path.relpath(fpath, root))
             if resolve_asset_path(abs_json, '.png'):
@@ -241,8 +262,50 @@ class Scanner:
         return {
             'package_path': pp, 'name': name, 'type': atype,
             'file_path': os.path.relpath(fpath, root).replace('\\', '/'),
-            'file_size': fsize, 'exported': exported, 'references': list(refs)
+            'file_size': fsize, 'exported': exported, 'references': list(refs),
+            'tri_count': tri_count, 'glb_size': glb_size
         }
+
+    @staticmethod
+    def count_glb_tris_fast(glb_path):
+        """Count total triangles in a GLB file (fast, no vertex extraction)."""
+        try:
+            from pygltflib import GLTF2
+            gltf = GLTF2().load(glb_path)
+            total = 0
+            for mesh in gltf.meshes:
+                for prim in mesh.primitives:
+                    if prim.mode not in (None, 4):
+                        continue
+                    if prim.indices is not None:
+                        idx_acc = gltf.accessors[prim.indices]
+                        total += idx_acc.count // 3
+                    elif prim.attributes.POSITION is not None:
+                        pos_acc = gltf.accessors[prim.attributes.POSITION]
+                        total += pos_acc.count // 3
+            return total
+        except Exception:
+            return None
+
+    @staticmethod
+    def count_json_tris(json_path):
+        """Count triangles from AggGeom.ConvexElems in a StaticMesh JSON."""
+        try:
+            with open(json_path, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+            entries = data if isinstance(data, list) else [data]
+            total = 0
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                props = e.get('Properties') or {}
+                agg = props.get('AggGeom') or {}
+                for ce in agg.get('ConvexElems', []):
+                    idata = ce.get('IndexData', [])
+                    total += len(idata) // 3
+            return total if total > 0 else None
+        except Exception:
+            return None
 
 
 # ======================== Graph Canvas ========================
@@ -711,7 +774,8 @@ class App:
         # First pass: insert assets
         for a in assets:
             aid = self.db.add_asset(a['package_path'], a['name'], a['type'],
-                                    a['file_path'], a['file_size'], a.get('exported', 0))
+                                    a['file_path'], a['file_size'], a.get('exported', 0),
+                                    a.get('tri_count'), a.get('glb_size'))
             a['id'] = aid
         # Second pass: insert references
         for a in assets:

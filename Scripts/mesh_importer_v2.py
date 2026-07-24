@@ -62,6 +62,18 @@ ROLE_SETTINGS = {
         'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_MASKS',
         'connections': [],  # Mask textures don't connect to standard outputs directly
     },
+    'virtual_mask': {
+        'srgb': False,
+        'compression': 'unreal.TextureCompressionSettings.TC_MASKS',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_VIRTUAL_MASKS',
+        'connections': [],
+    },
+    'virtual_color': {
+        'srgb': True,
+        'compression': 'unreal.TextureCompressionSettings.TC_DEFAULT',
+        'sampler_type': 'unreal.MaterialSamplerType.SAMPLERTYPE_VIRTUAL_COLOR',
+        'connections': [('RGB', 'unreal.MaterialProperty.MP_BASE_COLOR')],
+    },
 }
 
 
@@ -80,8 +92,9 @@ def get_fmodel_roots(fmodel_root):
     FModel layout:
       - JSON  at: I:/FModelOutput/Exports/SLASHER/Content/SLASHER/...
       - GLB/PNG at: I:/FModelOutput/SLASHER/Content/SLASHER/...  (no 'Exports')
-    Both share the '.../Content' + UE-relative-path structure, so we return both
-    the given root and its variant with the 'Exports' segment removed/added.
+    The /Game/ path maps to the Content directory, so when fmodel_root is
+    I:/FModelOutput/Exports, the actual content is under SLASHER/Content/.
+    We also handle the Exports-removed variant for GLB/PNG files.
     """
     norm = fmodel_root.replace('\\', '/').rstrip('/')
     roots = [norm]
@@ -93,13 +106,21 @@ def get_fmodel_roots(fmodel_root):
             roots.append(no_exports)
     else:
         # Variant with 'Exports' inserted before the first 'SLASHER'/content root
-        # Insert 'Exports' right after the drive/base if there's a known content marker
         for i, p in enumerate(parts):
             if p and i > 0:
                 with_exports = '/'.join(parts[:i] + ['Exports'] + parts[i:])
                 if with_exports not in roots:
                     roots.append(with_exports)
                 break
+    # Add SLASHER/Content and Content subdirectory variants for each root
+    # (needed when fmodel_root is the top-level export dir like I:/FModelOutput/Exports)
+    extra = []
+    for root in roots:
+        for sub in ('SLASHER/Content', 'Content'):
+            candidate = root.rstrip('/') + '/' + sub
+            if os.path.isdir(candidate) and candidate not in roots and candidate not in extra:
+                extra.append(candidate)
+    roots.extend(extra)
     return roots
 
 
@@ -157,7 +178,10 @@ def parse_mesh_sections(mesh_json_path):
             continue
         sms = e.get('Properties', {}).get('StaticMaterials', [])
         for sm in sms:
-            mi = sm.get('MaterialInterface', {})
+            mi = sm.get('MaterialInterface')
+            if not mi or not isinstance(mi, dict):
+                # MaterialInterface is null — skip this slot
+                continue
             obj_name = mi.get('ObjectName', '')
             obj_path = mi.get('ObjectPath', '')
             if not obj_path:
@@ -306,6 +330,8 @@ def guess_role_from_suffix(filename):
     name = filename.upper()
     # Check longer suffixes first to avoid false matches
     suffix_map = [
+        ('_VIRTUALMASK', 'virtual_mask'),
+        ('_VIRTUALCOLOR', 'virtual_color'),
         ('_OCCLUSIONROUGHNESSMETALLIC', 'orm'),
         ('_ORM', 'orm'),
         ('_NORMAL', 'normal'),
@@ -331,6 +357,10 @@ def guess_role_from_param_name(param_name):
     if not param_name:
         return None
     pn = param_name.lower()
+    if 'virtualmask' in pn:
+        return 'virtual_mask'
+    if 'virtualcolor' in pn:
+        return 'virtual_color'
     if 'normal' in pn:
         return 'normal'
     if 'orm' in pn or 'roughness' in pn or 'specular' in pn:
@@ -653,6 +683,15 @@ result = "ok"
         add('            break')
         add('if not (texture and isinstance(texture, unreal.Texture)):')
         add('    return "ERROR: Texture import failed"')
+        add(f'_expected_name = "{name}"')
+        add('if texture.get_name() != _expected_name:')
+        add(f'    _new_path = "{dest_dir}/" + _expected_name')
+        add('    try:')
+        add('        unreal.EditorAssetLibrary.rename_asset(texture.get_path_name(), _new_path)')
+        add('        texture = unreal.load_asset(_new_path)')
+        add('        tex_path = _new_path')
+        add('    except Exception as _re:')
+        add('        print("WARN: rename to full name failed: %s" % str(_re))')
         add(f'texture.set_editor_property("compression_settings", {compression})')
         add(f'texture.set_editor_property("srgb", {srgb_str})')
         add('unreal.EditorAssetLibrary.save_asset(texture.get_path_name())')
@@ -688,7 +727,9 @@ finally:
         add('import unreal')
         add(f'tex = unreal.load_asset("{dest_path}")')
         add('if not tex:')
-        add('    # UE may have truncated the asset name on import; search directory by suffix')
+        add('    # UE may have truncated the asset name on import; search directory')
+        add('    # Match by prefix: found name must be a prefix of expected name')
+        add('    # (truncation removes characters from the end, not the beginning)')
         add(f'    _pkg = "{dest_path}"')
         add('    _pkg_dir = _pkg.rsplit("/", 1)[0] if "/" in _pkg else ""')
         add('    _exp_name = _pkg.rsplit("/", 1)[-1] if "/" in _pkg else _pkg')
@@ -696,9 +737,12 @@ finally:
         add('    if _pkg_dir and _suffix:')
         add('        for _ap in unreal.EditorAssetLibrary.list_assets(_pkg_dir, recursive=False):')
         add('            _ao = unreal.load_asset(_ap)')
-        add('            if _ao and isinstance(_ao, unreal.Texture) and _ao.get_name().endswith(_suffix):')
-        add('                tex = _ao')
-        add('                break')
+        add('            if _ao and isinstance(_ao, unreal.Texture):')
+        add('                _found_name = _ao.get_name()')
+        add('                # Must end with the same suffix AND be a prefix of expected name')
+        add('                if _found_name.endswith(_suffix) and _exp_name.startswith(_found_name):')
+        add('                    tex = _ao')
+        add('                    break')
         add('if not tex:')
         add(f'    return "ERROR: texture not found: {dest_path}"')
         add('cur_srgb = tex.get_editor_property("srgb")')
@@ -760,7 +804,7 @@ finally:
         add('if not mat:')
         add('    return "ERROR: Failed to create material"')
 
-        connected = {'diffuse': False, 'normal': False, 'orm': False}
+        connected = {'diffuse': False, 'normal': False, 'orm': False, 'virtual_color': False}
         y = 0
         for tp in tex_param_defs:
             pname = tp['param_name']
@@ -791,7 +835,7 @@ finally:
             y += 200
 
         # Fallback default connections for unconnected outputs
-        if not connected['diffuse']:
+        if not connected['diffuse'] and not connected['virtual_color']:
             add('root_diffuse = unreal.MaterialEditingLibrary.create_material_expression(mat, unreal.MaterialExpressionConstant3Vector, -800, 0)')
             add('root_diffuse.set_editor_property("Constant", unreal.LinearColor(0.5, 0.5, 0.5, 1.0))')
             add('unreal.MaterialEditingLibrary.connect_material_property(root_diffuse, "RGB", unreal.MaterialProperty.MP_BASE_COLOR)')
@@ -910,13 +954,23 @@ finally:
             for line in expected_dict_str.split('\n'):
                 add(line)
         add('}')
+        add('# Determine asset type — could be MaterialInstanceConstant or Material')
+        add('is_mic = isinstance(mic, unreal.MaterialInstanceConstant)')
+        add('is_mat = isinstance(mic, unreal.Material) and not is_mic')
         add('current = {}')
-        add('tpv = mic.get_editor_property("texture_parameter_values")')
-        add('for entry in tpv:')
-        add('    pinfo = entry.get_editor_property("parameter_info")')
-        add('    pname = pinfo.get_editor_property("name")')
-        add('    ptex = entry.get_editor_property("parameter_value")')
-        add('    current[pname] = ptex.get_path_name() if ptex else ""')
+        add('if is_mic:')
+        add('    # Use MaterialEditingLibrary API (type-safe, avoids direct editor property access)')
+        add('    for pname in expected:')
+        add('        cur_tex = unreal.MaterialEditingLibrary.get_material_instance_texture_parameter_value(mic, pname)')
+        add('        current[pname] = cur_tex.get_path_name() if cur_tex else ""')
+        add('elif is_mat:')
+        add('    # Asset is a Material (not MIC) — use Material API to read default texture params')
+        add('    print("WARN: asset at %s is Material, not MaterialInstanceConstant" % "{dest_path}")')
+        add('    for pname in expected:')
+        add('        cur_tex = unreal.MaterialEditingLibrary.get_material_default_texture_parameter_value(mic, pname)')
+        add('        current[pname] = cur_tex.get_path_name() if cur_tex else ""')
+        add('else:')
+        add('    return "ERROR: asset at %s is neither Material nor MIC (type=%s)" % ("{dest_path}", type(mic).__name__)')
         add('mismatches = []')
         add('fixed = []')
         add('failed = []')
@@ -941,13 +995,40 @@ finally:
         add('            exp_suffix = "_" + exp_name.rsplit("_", 1)[-1] if "_" in exp_name else ""')
         add('            pkg_dir = exp_pkg.rsplit("/", 1)[0] if "/" in exp_pkg else ""')
         add('            if pkg_dir and exp_suffix:')
-        add('                for ap in unreal.EditorAssetLibrary.list_assets(pkg_dir, recursive=False):')
-        add('                    ao = unreal.load_asset(ap)')
-        add('                    if ao and isinstance(ao, unreal.Texture) and ao.get_name().endswith(exp_suffix):')
-        add('                        tex = ao')
-        add('                        break')
+        add('                try:')
+        add('                    for ap in unreal.EditorAssetLibrary.list_assets(pkg_dir, recursive=False):')
+        add('                        ao = unreal.load_asset(ap)')
+        add('                        if ao and isinstance(ao, unreal.Texture):')
+        add('                            found_name = ao.get_name()')
+        add('                            # suffix match AND prefix match (truncation removes chars from end, not beginning)')
+        add('                            if found_name.endswith(exp_suffix) and exp_name.startswith(found_name):')
+        add('                                tex = ao')
+        add('                                break')
+        add('                except Exception as ex:')
+        add('                    print("WARN: dir listing failed: %s" % str(ex))')
         add('        if tex:')
-        add('            unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(mic, pname, tex)')
+        add('            if is_mic:')
+        add('                unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(mic, pname, tex)')
+        add('            else:')
+        add('                # Material: find TSP2D node and set texture directly')
+        add('                target_node = None')
+        add('                try:')
+        add('                    expressions = mic.get_editor_property("expressions")')
+        add('                    for expr in expressions:')
+        add('                        if isinstance(expr, unreal.MaterialExpressionTextureSampleParameter2D):')
+        add('                            if expr.get_editor_property("parameter_name") == pname:')
+        add('                                target_node = expr')
+        add('                                break')
+        add('                except Exception:')
+        add('                    for obj in unreal.ObjectIterator():')
+        add('                        if obj.get_outer() == mic and isinstance(obj, unreal.MaterialExpressionTextureSampleParameter2D):')
+        add('                            if obj.get_editor_property("parameter_name") == pname:')
+        add('                                target_node = obj')
+        add('                                break')
+        add('                if target_node:')
+        add('                    target_node.set_editor_property("texture", tex)')
+        add('                else:')
+        add('                    print("WARN: TSP2D node not found for param %s in Material" % pname)')
         add('            fixed.append("%s: %s -> %s" % (pname, cur, tex.get_path_name()))')
         add('        else:')
         add('            # Diagnostics: why did all fallbacks fail?')
@@ -969,7 +1050,8 @@ finally:
         add('            failed.append("%s: %s [%s]" % (pname, expected_path, "; ".join(diag)))')
         add('            print("ERROR: texture not found for param %s: %s | %s" % (pname, expected_path, "; ".join(diag)))')
         add('if fixed:')
-        add('    unreal.MaterialEditingLibrary.update_material_instance(mic)')
+        add('    if is_mic:')
+        add('        unreal.MaterialEditingLibrary.update_material_instance(mic)')
         add(f'    unreal.EditorAssetLibrary.save_asset("{dest_path}")')
         add('parts = []')
         add('if fixed: parts.append("fixed %d [%s]" % (len(fixed), "; ".join(fixed)))')
@@ -1043,24 +1125,36 @@ finally:
         add('        if not tex:')
         add('            tex = unreal.load_asset(exp_pkg)')
         add('        if not tex:')
-        add('            # Fallback: search directory by suffix (UE truncates long names)')
+        add('            # Fallback: search directory (UE truncates long names)')
+        add('            # Match by prefix: found name must be a prefix of expected name')
         add('            exp_name = exp_pkg.rsplit("/", 1)[-1] if "/" in exp_pkg else exp_pkg')
         add('            exp_suffix = "_" + exp_name.rsplit("_", 1)[-1] if "_" in exp_name else ""')
         add('            pkg_dir = exp_pkg.rsplit("/", 1)[0] if "/" in exp_pkg else ""')
         add('            if pkg_dir and exp_suffix:')
         add('                for ap in unreal.EditorAssetLibrary.list_assets(pkg_dir, recursive=False):')
         add('                    ao = unreal.load_asset(ap)')
-        add('                    if ao and isinstance(ao, unreal.Texture) and ao.get_name().endswith(exp_suffix):')
-        add('                        tex = ao')
-        add('                        break')
+        add('                    if ao and isinstance(ao, unreal.Texture):')
+        add('                        found_name = ao.get_name()')
+        add('                        if found_name.endswith(exp_suffix) and exp_name.startswith(found_name):')
+        add('                            tex = ao')
+        add('                            break')
         add('        if tex:')
-        add('            # Find the TSP2D node via ObjectIterator (expressions property is protected)')
+        add('            # Find the TSP2D node via material expressions array (more reliable than ObjectIterator)')
         add('            target_node = None')
-        add('            for obj in unreal.ObjectIterator():')
-        add('                if obj.get_outer() == mat and isinstance(obj, unreal.MaterialExpressionTextureSampleParameter2D):')
-        add('                    if obj.get_editor_property("parameter_name") == pname:')
-        add('                        target_node = obj')
-        add('                        break')
+        add('            try:')
+        add('                expressions = mat.get_editor_property("expressions")')
+        add('                for expr in expressions:')
+        add('                    if isinstance(expr, unreal.MaterialExpressionTextureSampleParameter2D):')
+        add('                        if expr.get_editor_property("parameter_name") == pname:')
+        add('                            target_node = expr')
+        add('                            break')
+        add('            except Exception:')
+        add('                # Fallback: ObjectIterator')
+        add('                for obj in unreal.ObjectIterator():')
+        add('                    if obj.get_outer() == mat and isinstance(obj, unreal.MaterialExpressionTextureSampleParameter2D):')
+        add('                        if obj.get_editor_property("parameter_name") == pname:')
+        add('                            target_node = obj')
+        add('                            break')
         add('            if target_node:')
         add('                target_node.set_editor_property("texture", tex)')
         add('                fixed.append("%s: %s -> %s" % (pname, cur, tex.get_path_name()))')
@@ -1234,12 +1328,13 @@ finally:
 class MeshImportPipeline:
     """Orchestrates the 5-step import pipeline."""
 
-    def __init__(self, fmodel_root, content_root, ue_host='239.0.0.1', ue_port=6766):
+    def __init__(self, fmodel_root, content_root, ue_host='239.0.0.1', ue_port=6766, skip_existing_glb=True):
         self.fmodel_root = fmodel_root
         self.content_root = content_root
         self.ue_host = ue_host
         self.ue_port = ue_port
         self.client = None
+        self.skip_existing_glb = skip_existing_glb
 
     def log(self, msg):
         print(msg)
@@ -1364,6 +1459,14 @@ class MeshImportPipeline:
             return
 
         dest = ue_path_to_import_dest(mesh_ue_path, self.content_root)
+
+        # Skip GLB import if mesh already exists in UE and skip is enabled
+        if self.skip_existing_glb:
+            exists = self._run_eval(UECommandBuilder.asset_exists(dest))
+            if exists.lower() in ('true', '1'):
+                self.log(f"  SKIP (exists): {os.path.basename(glb_file)} -> {dest}")
+                return
+
         self.log(f"  Importing: {os.path.basename(glb_file)} -> {dest}")
         cmd = UECommandBuilder.import_mesh(glb_file, dest)
         r = self._run_cmd(cmd, timeout=300)
@@ -1448,6 +1551,13 @@ class MeshImportPipeline:
             # Check if already exists
             exists = self._run_eval(UECommandBuilder.asset_exists(dest))
             if exists.lower() in ('true', '1'):
+                # Non-parameterized materials use texture filenames as param names,
+                # which don't exist as TSP2D node parameter names in the material.
+                # Skip check_and_fix for them; only check parameterized materials.
+                if not info.get('has_tex_params', True):
+                    self.log(f"  SKIP (exists, non-parameterized): {os.path.basename(mat_path)}")
+                    continue
+
                 # Build expected_textures for checking (same logic as creation below)
                 expected_textures = {}
                 if info.get('has_tex_params', True):
@@ -1463,11 +1573,6 @@ class MeshImportPipeline:
                         if tex_ue_path:
                             tex_dest = ue_path_to_import_dest(tex_ue_path, self.content_root)
                             expected_textures[pname] = tex_dest
-                else:
-                    for dt in info.get('direct_textures', []):
-                        pname = dt['param_name']
-                        tex_dest = ue_path_to_import_dest(dt['tex_ue_path'], self.content_root)
-                        expected_textures[pname] = tex_dest
 
                 if expected_textures:
                     self.log(f"  CHECK (exists): {os.path.basename(mat_path)}")
