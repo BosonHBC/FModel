@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -143,6 +143,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CUE4Parse\CUE4Parse-Conversion\CUE4Parse-Conversion.csproj" />
+    <ProjectReference Include="..\FModel.Export\FModel.Export.csproj" />
     <ProjectReference Include="..\CUE4Parse\CUE4Parse\CUE4Parse.csproj" />
     <ProjectReference Include="..\Snooper\Editor\Editor.csproj" />
   </ItemGroup>

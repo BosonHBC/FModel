@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "pbz": {
+      "game": "GAME_PhantomBladeZero",
+      "dataDirectory": ".data"
+    }
+  }
+}

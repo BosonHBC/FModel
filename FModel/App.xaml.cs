@@ -149,6 +149,7 @@ public partial class App
                 .WriteTo.File(outputTemplate: template2, path: filePath, shared: true))
             .MinimumLevel.Override("CUE4Parse_Conversion", LogEventLevel.Verbose)
             .WriteTo.Sink(ImGuiSink.Instance)
+            .WriteTo.Sink(FModel.Export.DiagnosticSink.Instance)
             .CreateLogger();
 
         CacheManager.MigrateLegacyFiles();

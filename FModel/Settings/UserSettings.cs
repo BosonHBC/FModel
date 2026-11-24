@@ -19,6 +19,10 @@ namespace FModel.Settings;
 public sealed class UserSettings : ViewModel
 {
     public static UserSettings Default { get; set; }
+    public int JsonExportWorkers { get; set; } = 2;
+    public int JsonExportMemoryMb { get; set; } = 4096;
+    public string JsonExportExisting { get; set; } = "skip";
+    public bool JsonExportCompact { get; set; }
 #if DEBUG
     public bool SuppressViewerLogs { get; set; }
 

@@ -21,6 +21,23 @@
     <adonisControls:AdonisWindow.Resources>
         <ResourceDictionary>
             <controls:OnTagDataTemplateSelector x:Key="TagTemplateSelector" />
+            <DataTemplate x:Key="JsonExportTemplate">
+                <StackPanel Margin="12">
+                    <TextBlock Text="Batch JSON Export" FontSize="18" Margin="0 0 0 16" />
+                    <TextBlock Text="Existing files" Margin="0 0 0 4" />
+                    <ComboBox SelectedValuePath="Content" SelectedValue="{Binding JsonExportExisting, Source={x:Static local:Settings.UserSettings.Default}, Mode=TwoWay}" Margin="0 0 0 12">
+                        <ComboBoxItem Content="skip" />
+                        <ComboBoxItem Content="resume" />
+                        <ComboBoxItem Content="overwrite" />
+                    </ComboBox>
+                    <TextBlock Text="Workers (1-32; unvalidated presets fall back to 1)" Margin="0 0 0 4" />
+                    <TextBox Text="{Binding JsonExportWorkers, Source={x:Static local:Settings.UserSettings.Default}, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Margin="0 0 0 12" />
+                    <TextBlock Text="Soft memory budget (MiB, minimum 256)" Margin="0 0 0 4" />
+                    <TextBox Text="{Binding JsonExportMemoryMb, Source={x:Static local:Settings.UserSettings.Default}, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Margin="0 0 0 12" />
+                    <CheckBox Content="Compact JSON (same properties, fewer whitespace characters)" IsChecked="{Binding JsonExportCompact, Source={x:Static local:Settings.UserSettings.Default}, Mode=TwoWay}" Margin="0 0 0 12" />
+                    <TextBlock TextWrapping="Wrap" Text="skip preserves existing nonempty files before parsing; legacy files are marked skipped-unverified. resume requires matching successful records. overwrite explicitly replaces selected outputs after a successful write. Progress and reports are available in the log and output/.fmodel-export folder." />
+                </StackPanel>
+            </DataTemplate>
             <DataTemplate x:Key="GeneralTemplate">
                 <Grid adonisExtensions:LayerExtension.Layer="2">
                     <Grid.RowDefinitions>
@@ -747,6 +764,7 @@
                     </Style>
                 </TreeViewItem.Style>
             </TreeViewItem>
+            <TreeViewItem Tag="JsonExportTemplate" Header="Batch JSON Export" />
             <TreeViewItem Tag="ThemesTemplate">
                 <TreeViewItem.Header>
                     <StackPanel Orientation="Horizontal">

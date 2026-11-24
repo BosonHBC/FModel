@@ -4,4 +4,8 @@
   <Project Path="../Snooper/Editor/Editor.csproj" />
   <Project Path="../Snooper/Snooper/Snooper.csproj" />
   <Project Path="FModel.csproj" />
+  <Project Path="../FModel.Export/FModel.Export.csproj" />
+  <Project Path="../FModel.Cli/FModel.Cli.csproj" />
+  <Project Path="../FModel.Export.Tests/FModel.Export.Tests.csproj" />
+  <Project Path="../FModel.Export.Benchmarks/FModel.Export.Benchmarks.csproj" />
 </Solution>

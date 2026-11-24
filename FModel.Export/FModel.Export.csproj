@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Version>4.4.4</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../CUE4Parse/CUE4Parse/CUE4Parse.csproj" />
+    <ProjectReference Include="../CUE4Parse/CUE4Parse-Conversion/CUE4Parse-Conversion.csproj" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="Serilog" Version="4.3.1" />
+  </ItemGroup>
+</Project>

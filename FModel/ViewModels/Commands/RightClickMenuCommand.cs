@@ -76,6 +76,12 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
             _ => throw new ArgumentOutOfRangeException("Unsupported asset action."),
         };
 
+        if (bulktype == EBulkType.Properties && (folders.Length > 0 || assets.Length > 1))
+        {
+            await BulkJsonExport.Execute(contextViewModel, folders, assets);
+            return;
+        }
+
         Interlocked.Exchange(ref contextViewModel.CUE4Parse.ExportedCount, 0);
         Interlocked.Exchange(ref contextViewModel.CUE4Parse.FailedExportCount, 0);
         await _threadWorkerView.Begin(cancellationToken =>
